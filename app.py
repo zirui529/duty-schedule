@@ -460,7 +460,14 @@ if "temp_new_member" not in st.session_state:
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
 
-menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
+# 检查URL参数，如果page=self就直接进入自助上传页面
+_query = st.query_params
+_is_self_page = _query.get("page", "") == "self"
+
+if _is_self_page:
+    menu = "成员自助上传"
+else:
+    menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
 
 if menu == "管理员后台":
     if not st.session_state.login:
@@ -664,15 +671,23 @@ if menu == "管理员后台":
                         with st.spinner("正在填充你的模板PDF..."):
                             out_buf = fill_user_template_pdf(st.session_state.user_template_bytes, st.session_state.schedule_result, int(off_x), int(off_y))
                         st.download_button("下载填充好的值班表", out_buf, file_name="值班表_已填充.pdf", mime="application/pdf")
-
         with tab5:
             st.subheader("分享自助提交链接")
             st.info("把下面这个链接发给成员，他们可以免登录自助上传课表、填写个性化需求")
-            app_url = st.text_input("部署后的网址", value="http://localhost:8501")
-            self_link = f"{app_url}?page=self"
+            # 使用st.context.url自动获取真实访问地址，区分本地/云端部署
+            try:
+                base_app_url = str(st.context.url)
+            except Exception:
+                base_app_url = "http://localhost:8501"
+            # 去除末尾斜杠，避免拼接出现双斜杠
+            base_app_url = base_app_url.rstrip("/")
+            self_link = f"{base_app_url}?page=self"
+            st.text_input("自动识别得到网址（请勿修改）", value=base_app_url, disabled=True)
             st.code(self_link, language="text")
             if st.button("复制链接提示"):
                 st.success("链接已生成，直接复制发给成员即可！")
+
+
 
         if tab6 is not None:
             with tab6:
