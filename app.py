@@ -21,9 +21,15 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 
-VOLC_API_KEY = ""
-VOLC_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-MODEL_ID = ""
+# 火山方舟配置，从Streamlit Secrets读取
+try:
+    VOLC_API_KEY = st.secrets["ARK_API_KEY"]
+    VOLC_ENDPOINT = st.secrets["ARK_ENDPOINT"]
+    MODEL_ID = st.secrets["ARK_MODEL_ENDPOINT_ID"]
+except KeyError:
+    st.error("缺少火山方舟密钥，请在Streamlit Settings -> Secrets配置ARK_API_KEY、ARK_ENDPOINT、ARK_MODEL_ENDPOINT_ID")
+    st.stop()
+
 API_TIMEOUT = 30
 MAX_RETRY = 0
 MAX_WORKERS = 4
@@ -201,7 +207,8 @@ def fast_ai_extract(text:str, personal_need:str=""):
             return "、".join(arr1)
         else:
             return "无"
-    except Exception:
+    except Exception as e:
+        st.error(f"AI调用失败: {e}")
         return "无"
 
 # ========== 判断某人在某时段是否有空 ==========
