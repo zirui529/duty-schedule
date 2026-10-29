@@ -165,6 +165,11 @@ def fast_ai_extract(text:str, personal_need:str=""):
         if out.startswith("```"):
             out = re.sub(r"^```[a-z]*\n?", "", out)
             out = re.sub(r"\n?```$", "", out)
+        # 用正则提取JSON数组，不管AI前面加了什么解释文字
+        import re as _re
+        _match = _re.search(r'\[.*\]', out, _re.DOTALL)
+        if _match:
+            out = _match.group()
         return out
 
     personal_section = ""
@@ -194,22 +199,34 @@ def fast_ai_extract(text:str, personal_need:str=""):
 - 下午班（13:00-17:00）冲突：第6、7、8、9节有课就算
 - 晚上班（17:00-20:00）冲突：第9、10、11、12节有课就算（第13节20:10开始，不算）
 
-⚠️ 特别提醒（非常重要）：
+⚠️ 特别提醒（非常重要，必须逐条遵守）：
 1. 晚上的课最容易被漏掉！请你从头到尾通读课表文本，不要只看前半部分！
 2. 很多PDF课表的晚上课排在表格下方，甚至单独一行，很容易被忽略！
 3. 对每一天，都要分别确认：上午有没有课？下午有没有课？晚上有没有课？
 4. 只要那天下午的课排得比较靠后（超过3节），就要检查晚上是不是也有课！
 5. 不要因为"晚上应该没课"就跳过，必须以课表文本为准！
+6. 不要只找"第9节""第10节"这样的标注！如果表格里傍晚、晚上、晚些时候有课，就算晚上班冲突！
+7. 如果你不确定某天晚上有没有课，就宁可加进去，也不要漏掉！
 
-只输出JSON数组格式，不要任何解释文字
+只输出纯字符串组成的JSON数组，例如：["周一上午", "周一下午", "周三晚上"]
+不要输出对象、键值对、字典格式，数组里每个元素必须是纯字符串。
+不要任何解释文字，不要markdown代码块。
 {personal_section}
 
-课表文本如下：
-{text[:2000]}"""
+课表文本如下（可能有多张表、多页内容，请全部看完，不要只看前半部分）：
+{text[:8000]}"""
 
     try:
         out1 = call_ai(prompt1)
         arr1 = json.loads(out1)
+        # 兼容AI返回dict数组的情况，统一转成字符串
+        _processed = []
+        for _item in arr1:
+            if isinstance(_item, dict):
+                _processed.append(str(list(_item.values())[0]))
+            else:
+                _processed.append(str(_item))
+        arr1 = _processed
         if len(arr1) < 2:
             prompt2 = f"""重新检查一遍！重点检查每天下午和晚上有没有漏掉的课！
 已经识别出的不能值班的时段：{arr1}
@@ -221,9 +238,17 @@ def fast_ai_extract(text:str, personal_need:str=""):
 还是只输出完整的JSON数组（包含所有不能值班的时段），不要解释。
 {personal_section}
 课表文本：
-{text[:2000]}"""
+{text[:8000]}"""
             out2 = call_ai(prompt2)
             arr2 = json.loads(out2)
+            # 兼容AI返回dict数组的情况
+            _processed2 = []
+            for _item in arr2:
+                if isinstance(_item, dict):
+                    _processed2.append(str(list(_item.values())[0]))
+                else:
+                    _processed2.append(str(_item))
+            arr2 = _processed2
             combined = list(set(arr1 + arr2))
             arr1 = combined
         if isinstance(arr1, list) and len(arr1) > 0:
