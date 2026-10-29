@@ -1,4 +1,10 @@
 streamlit
 pandas
+numpy
 pymupdf
 openpyxl
+reportlab
+requests
+Pillow
+python-dateutil
+
