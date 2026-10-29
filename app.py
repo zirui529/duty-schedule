@@ -144,6 +144,8 @@ def parse_filename_phone_and_role(filename):
 
 # ========== AI综合解析 ==========
 def fast_ai_extract(text:str, personal_need:str=""):
+    if not text or len(text.strip()) < 10:
+        return "课表文本提取失败，请手动填写"
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     
     def call_ai(prompt_text):
@@ -227,10 +229,9 @@ def fast_ai_extract(text:str, personal_need:str=""):
         if isinstance(arr1, list) and len(arr1) > 0:
             return "、".join(arr1)
         else:
-            return "无"
+            return "识别为空，请手动检查"
     except Exception as e:
-        st.error(f"AI调用失败: {e}")
-        return "无"
+        return f"识别失败: {str(e)[:60]}"
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -526,8 +527,7 @@ if menu == "管理员后台":
                                         try:
                                             current_rows[idx]["class_conflict"] = fut.result()
                                         except Exception as e:
-                                            st.error(f"第{idx+1}个人AI识别失败: {e}")
-                                            current_rows[idx]["class_conflict"] = "无"
+                                            current_rows[idx]["class_conflict"] = f"识别失败: {str(e)[:60]}"
                                         done += 1
                                         bar.progress(done/len(need_ai_texts))
                             for row in current_rows:
