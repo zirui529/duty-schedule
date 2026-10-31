@@ -41,12 +41,14 @@ SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
 ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 FONT_NAME = 'STSong-Light'
+
 def safe_str(val):
     if val is None:
         return ""
     if isinstance(val, float) and pd.isna(val):
         return ""
     return str(val).strip()
+
 # ========== 管理员文件读写 ==========
 def init_admin():
     if not os.path.exists(ADMIN_FILE):
@@ -62,23 +64,28 @@ def init_admin():
         except:
             data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
             json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def load_admin():
     init_admin()
     return json.load(open(ADMIN_FILE, "r", encoding="utf-8"))
+
 def save_admin(data):
     json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def verify_admin(username, password):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a["password"] == password:
             return a
     return None
+
 def is_super_admin(username):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a.get("is_super", False):
             return True
     return False
+
 def load_members():
     if os.path.exists(DATA_FILE):
         data = json.load(open(DATA_FILE, "r", encoding="utf-8"))
@@ -91,22 +98,27 @@ def load_members():
                 m["role"] = "学员"
         return data
     return []
+
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 # ========== PDF读取 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     txt = "".join(page.get_text() for page in doc)
     doc.close()
     return txt
+
 def get_session():
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=0)
     session.mount("https://", adapter)
     return session
+
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
     return m.group(1).strip() if m else ""
+
 def parse_filename_phone_and_role(filename):
     name_part = filename.split("-课表")[0]
     parts = name_part.split("&")
@@ -122,13 +134,15 @@ def parse_filename_phone_and_role(filename):
         if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
             phone = phone_candidate
     return role, phone
-# ========== AI综合解析【修复时间重叠规则版本】 ==========
-def _call_ai_raw(prompt_text):
+
+# ========== AI底层调用 两套独立接口 ==========
+def _call_course_ai(prompt_text):
+    """课表解析：返回 [{"week":"周一","sections":[3,4,5]}]"""
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL_ID,
         "messages": [
-            {"role":"system","content":"你是大学课表分析专家，只输出JSON数组，不输出任何解释、说明、markdown标记。"},
+            {"role":"system","content":"你是课表读取工具。只输出严格JSON数组，不要markdown、不要解释。每条对象：week字段为【周一/周二/周三/周四/周五/周六/周日】，sections是数组，存这一天有课的节次数字(1‑13)。没有课的星期不要输出。"},
             {"role":"user","content": prompt_text}
         ],
         "temperature": 0.0,
@@ -144,80 +158,112 @@ def _call_ai_raw(prompt_text):
     if not match:
         raise ValueError("模型未返回有效数组")
     arr = json.loads(match.group())
-    result = []
+    out_list = []
     for item in arr:
-        if isinstance(item, str):
-            result.append(item.strip())
-        elif isinstance(item, dict):
-            for v in item.values():
-                if isinstance(v, str):
-                    result.append(v.strip())
-        else:
-            result.append(str(item))
-    seen = set()
-    result = [x for x in result if not (x in seen or seen.add(x))]
-    return result
+        w = item.get("week")
+        sec = item.get("sections", [])
+        if w and isinstance(sec, list):
+            sec_clean = [int(s) for s in sec if isinstance(s,(int,str)) and str(s).isdigit()]
+            out_list.append({"week":w,"sections":sec_clean})
+    return out_list
+
+def _call_personal_ai(prompt_text):
+    """个性化需求解析：返回纯字符串数组 ["周四下午","周六上午"]"""
+    headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL_ID,
+        "messages": [
+            {"role":"system","content":"只输出JSON字符串数组，只输出星期+时段，例如[\"周四下午\"]，禁止输出对象，不要任何解释。"},
+            {"role":"user","content": prompt_text}
+        ],
+        "temperature":0.0,
+        "max_tokens":400
+    }
+    resp = get_session().post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    res = resp.json()
+    out = res["choices"][0]["message"]["content"].strip()
+    out = re.sub(r"^```[a-zA-Z]*\s*", "", out)
+    out = re.sub(r"\s*```$", "", out)
+    match = re.search(r"\[.*\]", out, re.DOTALL)
+    if not match:
+        return []
+    arr = json.loads(match.group())
+    return [s.strip() for s in arr if isinstance(s, str)]
+
+# 节次时间定义(分钟)
+SECTION_TIME = {
+    1: (8*60+0, 8*60+45),
+    2: (8*60+50, 9*60+35),
+    3: (9*60+50,10*60+35),
+    4: (10*60+40,11*60+25),
+    5: (11*60+30,12*60+15),
+    6: (14*60+5,14*60+50),
+    7: (14*60+55,15*60+40),
+    8: (15*60+45,16*60+30),
+    9: (16*60+40,17*60+25),
+    10:(17*60+30,18*60+15),
+    11:(18*60+30,19*60+15),
+    12:(19*60+20,20*60+5),
+    13:(20*60+10,20*60+55),
+}
+SHIFT_DEF = [
+    {"name":"上午","s":9*60,"e":13*60},
+    {"name":"下午","s":13*60,"e":17*60},
+    {"name":"晚上","s":17*60,"e":20*60},
+]
+
+def calc_course_conflict(ai_course_data):
+    """本地Python计算课表冲突，完全不受AI幻觉干扰"""
+    conflict = set()
+    week_map = {d["week"]:d["sections"] for d in ai_course_data}
+    for w_name, sec_list in week_map.items():
+        for sec in sec_list:
+            if sec not in SECTION_TIME:
+                continue
+            c_s, c_e = SECTION_TIME[sec]
+            for sh in SHIFT_DEF:
+                if not (c_e <= sh["s"] or c_s >= sh["e"]):
+                    conflict.add(f"{w_name}{sh['name']}")
+    return sorted(list(conflict))
 
 def fast_ai_extract(text:str, personal_need:str=""):
     if not text or len(text.strip()) < 10:
         return "课表文本提取失败，请手动填写"
+
     prompt_course = f"""
-【值班班次时间窗口】
-上午班：09:00‑13:00
-下午班：13:00‑17:00
-晚上班：17:00‑20:00
-
-【课程每节真实时间】
-1节 08:00‑08:45
-2节 08:50‑09:35
-3节 09:50‑10:35
-4节 10:40‑11:25
-5节 11:30‑12:15
-6节 14:05‑14:50
-7节 14:55‑15:40
-8节 15:45‑16:30
-9节 16:40‑17:25
-10节 17:30‑18:15
-11节 18:30‑19:15
-12节 19:20‑20:05
-13节 20:10‑20:55
-
-【核心判定铁则，必须严格遵守】
-1. 只有【课程时间段】和【值班班次时间段】存在时间重叠，才把该「星期+班次」加入冲突数组；
-2. 课程完全早于班次开始、或者课程完全晚于班次结束，绝对不要加入冲突；
-3. 例子：第13节20:10‑20:55，晚班20:00结束，二者无重叠 → 晚上班不冲突，不要加入；
-4. 例子：第9节16:40‑17:25，和下午班、晚上班均有重叠 → 下午、晚上都要加入冲突；
-5. 逐天逐班次完整检查，不能漏；
-6. 只输出上课导致冲突的["周一上午","周一下午"...]字符串JSON数组，不要任何解释。
-
-课表文本（可能有多张表、多页内容，请全部看完，不要只看前半部分）：
+读取这份课表，输出JSON数组。
+每条对象：
+"week":"周一|周二|周三|周四|周五|周六|周日",
+"sections":[有课的节次数字1‑13]
+规则：
+1.只看课表表格；某星期一行完全无课，则不要输出该星期。
+2.sections只填数字，例如[3,4,5,6,7,8]。
+3.只输出JSON，不要任何解释。
+课表文本：
 {text[:8000]}
 """
     try:
-        course_conflict_list = _call_ai_raw(prompt_course)
+        ai_course_data = _call_course_ai(prompt_course)
+        course_conflict_list = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
-    # 步骤2：只识别个性化追加冲突，不允许修改课表结果
+
     personal_conflict_list = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
-已有课表冲突时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
+已经由课表得到不能值班时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
 用户个性化需求：{personal_need}
-任务：只根据个性化需求，额外增加不能值班的时段。
+任务：只根据个性化需求，**额外追加**不能值班的时段。
 硬性规则：
-1. 只能新增个性化需求明确提到的时段；
-2. 绝对不能修改、删除、复制课表已有冲突；
-3. 绝对不能把课表里没有课的时段加进来；
-4. 如果没有额外限制，返回 []；
-5. 输出严格为字符串JSON数组，不要解释。
-示例：
-输入：周四下午骨干会跟会
-输出：["周四下午"]
+1. 只能新增时段，绝对不能删除、修改上面课表给出的冲突；
+2. 如果没有额外限制，返回 []；
+3. 输出纯字符串JSON数组，示例：["周六上午","周四下午"]。
 """
         try:
-            personal_conflict_list = _call_ai_raw(prompt_personal)
+            personal_conflict_list = _call_personal_ai(prompt_personal)
         except Exception:
             personal_conflict_list = []
+
     total_conflict = list(set(course_conflict_list + personal_conflict_list))
     if not total_conflict:
         return "识别为空，请手动检查"
@@ -232,6 +278,7 @@ def is_available(member, week_idx, shift_idx):
     if class_conflict and class_conflict != "无" and conflict_str in class_conflict:
         return False
     return True
+
 # ========== 智能排班 ==========
 def smart_schedule(member_list):
     stu_pool = [m for m in member_list if m["role"]=="学员"]
@@ -296,6 +343,7 @@ def smart_schedule(member_list):
     if wei_pool:
         st.success(f"✅ 职委排班完成：共 {len(wei_pool)} 名职委，平均每人排 {sum(wei_count.values())/len(wei_pool):.1f} 班")
     return schedule
+
 # ========== 模式A：系统自动生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
     buf = BytesIO()
@@ -323,6 +371,7 @@ def export_pdf_auto(schedule_data, template_name):
     c.save()
     buf.seek(0)
     return buf
+
 # ========== 模式B：填充用户模板 ==========
 def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset_y:int=-30):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
@@ -383,6 +432,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     doc.close()
     out_buf.seek(0)
     return out_buf
+
 # ========== 页面入口 ==========
 st.set_page_config(page_title="值班排班系统", layout="wide")
 if "login" not in st.session_state:
@@ -397,6 +447,7 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
+
 # 检查URL参数，如果page=self就直接进入自助上传页面
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
@@ -404,6 +455,7 @@ if _is_self_page:
     menu = "成员自助上传"
 else:
     menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
+
 if menu == "管理员后台":
     if not st.session_state.login:
         st.title("管理员登录")
@@ -599,12 +651,10 @@ if menu == "管理员后台":
         with tab5:
             st.subheader("分享自助提交链接")
             st.info("把下面这个链接发给成员，他们可以免登录自助上传课表、填写个性化需求")
-            # 使用st.context.url自动获取真实访问地址，区分本地/云端部署
             try:
                 base_app_url = str(st.context.url)
             except Exception:
                 base_app_url = "http://localhost:8501"
-            # 去除末尾斜杠，避免拼接出现双斜杠
             base_app_url = base_app_url.rstrip("/")
             self_link = f"{base_app_url}?page=self"
             st.text_input("自动识别得到网址（请勿修改）", value=base_app_url, disabled=True)
