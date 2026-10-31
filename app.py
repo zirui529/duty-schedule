@@ -14,13 +14,11 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
-
 # 火山方舟配置，从Streamlit Secrets读取
 try:
     VOLC_API_KEY = st.secrets["ARK_API_KEY"]
@@ -29,11 +27,9 @@ try:
 except KeyError:
     st.error("缺少火山方舟密钥，请在Streamlit Settings -> Secrets配置ARK_API_KEY、ARK_ENDPOINT、ARK_MODEL_ENDPOINT_ID")
     st.stop()
-
 API_TIMEOUT = 30
 MAX_RETRY = 0
 MAX_WORKERS = 4
-
 SHIFT_LIST = [
     {"shift_idx":0,"shift_name": "9:00‑13:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
@@ -41,21 +37,16 @@ SHIFT_LIST = [
 ]
 WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
-
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
-
 ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
-
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 FONT_NAME = 'STSong-Light'
-
 def safe_str(val):
     if val is None:
         return ""
     if isinstance(val, float) and pd.isna(val):
         return ""
     return str(val).strip()
-
 # ========== 管理员文件读写 ==========
 def init_admin():
     if not os.path.exists(ADMIN_FILE):
@@ -71,28 +62,23 @@ def init_admin():
         except:
             data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
             json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
 def load_admin():
     init_admin()
     return json.load(open(ADMIN_FILE, "r", encoding="utf-8"))
-
 def save_admin(data):
     json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
 def verify_admin(username, password):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a["password"] == password:
             return a
     return None
-
 def is_super_admin(username):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a.get("is_super", False):
             return True
     return False
-
 def load_members():
     if os.path.exists(DATA_FILE):
         data = json.load(open(DATA_FILE, "r", encoding="utf-8"))
@@ -105,27 +91,22 @@ def load_members():
                 m["role"] = "学员"
         return data
     return []
-
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
 # ========== PDF读取 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     txt = "".join(page.get_text() for page in doc)
     doc.close()
     return txt
-
 def get_session():
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=0)
     session.mount("https://", adapter)
     return session
-
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
     return m.group(1).strip() if m else ""
-
 def parse_filename_phone_and_role(filename):
     name_part = filename.split("-课表")[0]
     parts = name_part.split("&")
@@ -142,8 +123,7 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ========== AI综合解析 ==========
-# ========== AI综合解析 ==========
+# ========== AI综合解析【修复版本】 ==========
 def _call_ai_raw(prompt_text):
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -152,48 +132,60 @@ def _call_ai_raw(prompt_text):
             {"role":"system","content":"你是大学课表分析专家，只输出JSON数组，不输出任何解释、说明、markdown标记。"},
             {"role":"user","content": prompt_text}
         ],
-        "temperature":0.0,
-        "max_tokens":800,
-        "service_tier":"default"
+        "temperature": 0.0,
+        "max_tokens": 800,
+        "service_tier": "default"
     }
     resp = get_session().post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     res = resp.json()
     out = res["choices"][0]["message"]["content"].strip()
-    if out.startswith("```"):
-        out = re.sub(r"^```[a-z]*\n?", "", out)
-        out = re.sub(r"\n?```$", "", out)
-    _match = re.search(r'\[.*\]', out, re.DOTALL)
-    if _match:
-        out = _match.group()
-    arr = json.loads(out)
-    _processed = []
-    for _item in arr:
-        if isinstance(_item, dict):
-            _processed.append(str(list(_item.values())[0]))
+
+    out = re.sub(r"^```[a-zA-Z]*\s*", "", out)
+    out = re.sub(r"\s*```$", "", out)
+
+    match = re.search(r"\[.*\]", out, re.DOTALL)
+    if not match:
+        raise ValueError("模型未返回有效数组")
+
+    arr = json.loads(match.group())
+
+    result = []
+    for item in arr:
+        if isinstance(item, str):
+            result.append(item.strip())
+        elif isinstance(item, dict):
+            for v in item.values():
+                if isinstance(v, str):
+                    result.append(v.strip())
         else:
-            _processed.append(str(_item))
-    return _processed
+            result.append(str(item))
+
+    seen = set()
+    result = [x for x in result if not (x in seen or seen.add(x))]
+    return result
 
 
 def fast_ai_extract(text:str, personal_need:str=""):
     if not text or len(text.strip()) < 10:
         return "课表文本提取失败，请手动填写"
-    headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
 
-    # 步骤1：仅解析课表，只获取上课冲突，完全不碰个性化需求
+    # 步骤1：只识别课表冲突，不处理个性化需求
     prompt_course = f"""请分析下面大学课表文本，只输出【因为上课不能值班】的时段字符串数组。
-值班全部候选时段列表：
-["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
+
+只检查以下候选时段：
+["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上"]
 
 值班与节次对应规则：
-- 上午班（9:00‑13:00）冲突：第2、3、4、5节有课就算（第1节8:45下课，不算）
+- 上午班（9:00‑13:00）冲突：第2、3、4、5节有课就算
 - 下午班（13:00‑17:00）冲突：第6、7、8、9节有课就算
-- 晚上班（17:00‑20:00）冲突：第9、10、11、12节有课就算（第13节20:10开始，不算）
+- 晚上班（17:00‑20:00）冲突：第9、10、11、12节有课就算
 
-重要规则：
-1. 只识别【上课】导致不能值班的时段；不要脑补、不要加入任何个人请假、有事类限制；
-2. 逐天检查上午、下午、晚上，晚上课程容易遗漏，PDF课表晚上课程常在页面底部，务必读完全文；
-3. 输出严格是字符串JSON数组，例如["周一上午","周二晚上"]，无其他文字；
+严格要求：
+1. 只输出上课导致的冲突；
+2. 逐天逐段判断，不能遗漏；
+3. 有课的时段必须加入；
+4. 无课的时段绝对不能加入；
+5. 输出严格为字符串JSON数组，不要解释。
 
 课表文本：
 {text[:8000]}
@@ -203,24 +195,26 @@ def fast_ai_extract(text:str, personal_need:str=""):
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
 
-    # 步骤2：只解析个性化需求，仅允许追加，禁止修改课表结果
+    # 步骤2：只识别个性化追加冲突，不允许修改课表结果
     personal_conflict_list = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
-已有课表识别出来因上课不能值班的时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
+已有课表冲突时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
+
 用户个性化需求：{personal_need}
 
-任务：仅根据【个性化需求】提取额外新增的不能值班时段。
-硬性约束（必须严格执行）：
-1. 你只能输出因个人有事、会议、请假等【额外新增】的禁止值班时段；
-2. ❗严禁修改、删除、扩大上面课表给出的冲突/空闲结果；绝对不能把课表里空闲无事由的时段加入禁止列表；
-3. 只处理个性化描述，不要重新分析课表内容；
-4. 如果需求没有产生任何额外限制，返回空数组 []
-5. 输出格式：纯字符串JSON数组，不要任何解释。
+任务：只根据个性化需求，额外增加不能值班的时段。
+
+硬性规则：
+1. 只能新增个性化需求明确提到的时段；
+2. 绝对不能修改、删除、复制课表已有冲突；
+3. 绝对不能把课表里没有课的时段加进来；
+4. 如果没有额外限制，返回 []；
+5. 输出严格为字符串JSON数组，不要解释。
 
 示例：
-课表冲突：["周四上午"]；需求：周四下午骨干会跟会 → 输出 ["周四下午"]
-课表冲突：["周一上午"]；需求：无 → 输出 []
+输入：周四下午骨干会跟会
+输出：["周四下午"]
 """
         try:
             personal_conflict_list = _call_ai_raw(prompt_personal)
@@ -228,11 +222,11 @@ def fast_ai_extract(text:str, personal_need:str=""):
             personal_conflict_list = []
 
     total_conflict = list(set(course_conflict_list + personal_conflict_list))
-    if len(total_conflict) > 0:
-        return "、".join(total_conflict)
-    else:
+
+    if not total_conflict:
         return "识别为空，请手动检查"
 
+    return "、".join(total_conflict)
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -243,28 +237,27 @@ def is_available(member, week_idx, shift_idx):
     if class_conflict and class_conflict != "无" and conflict_str in class_conflict:
         return False
     return True
-
 # ========== 智能排班 ==========
 def smart_schedule(member_list):
     stu_pool = [m for m in member_list if m["role"]=="学员"]
     wei_pool = [m for m in member_list if m["role"]=="职委"]
-    
+
     st.info(f"📊 人员统计：学员 {len(stu_pool)} 人，职委 {len(wei_pool)} 人")
     if len(wei_pool) == 0:
         st.error("⚠️ 警告：人员库里没有职委！请去「人员库管理」把需要当职委的人身份改成「职委」")
-    
+
     random.shuffle(stu_pool)
     random.shuffle(wei_pool)
-    
+
     all_slots = []
     for w_idx, w in enumerate(WEEK_NAMES):
         for s_idx, s in enumerate(SHIFT_LIST):
             all_slots.append({"week_idx":w_idx, "shift_idx":s_idx, "week":w, "shift":s["shift_name"]})
-    
+
     stu_count = {m["name"]:0 for m in stu_pool}
     wei_count = {m["name"]:0 for m in wei_pool}
     schedule = []
-    
+
     slots_remaining = all_slots.copy()
     for slot in slots_remaining:
         w_idx = slot["week_idx"]
@@ -272,7 +265,7 @@ def smart_schedule(member_list):
         need_stu = SHIFT_LIST[s_idx]["need_stu"]
         slot["学员"] = []
         slot["职委"] = []
-        
+
         available_stu = [m for m in stu_pool if is_available(m, w_idx, s_idx) and stu_count[m["name"]] < 1]
         if len(available_stu) < need_stu:
             for m in stu_pool:
@@ -282,7 +275,7 @@ def smart_schedule(member_list):
             p = available_stu[i]
             slot["学员"].append(p)
             stu_count[p["name"]] += 1
-    
+
     if wei_pool:
         wei_cycle = wei_pool.copy()
         wei_ptr = 0
@@ -290,7 +283,7 @@ def smart_schedule(member_list):
             w_idx = slot["week_idx"]
             s_idx = slot["shift_idx"]
             need_wei = SHIFT_LIST[s_idx]["need_wei"]
-            
+
             picked = False
             for _ in range(len(wei_cycle)):
                 candidate = wei_cycle[wei_ptr % len(wei_cycle)]
@@ -300,7 +293,7 @@ def smart_schedule(member_list):
                     wei_count[candidate["name"]] += 1
                     picked = True
                     break
-            
+
             if not picked:
                 available_wei = [m for m in wei_pool if is_available(m, w_idx, s_idx)]
                 if available_wei:
@@ -310,18 +303,17 @@ def smart_schedule(member_list):
                 else:
                     slot["职委"].append(wei_pool[0])
                     wei_count[wei_pool[0]["name"]] += 1
-            
+
             schedule.append(slot)
-    
+
     rested = [name for name, cnt in stu_count.items() if cnt == 0]
     if rested:
         st.info(f"ℹ️ 本周共 {len(rested)} 名学员轮空：{'、'.join(rested)}")
-    
+
     if wei_pool:
         st.success(f"✅ 职委排班完成：共 {len(wei_pool)} 名职委，平均每人排 {sum(wei_count.values())/len(wei_pool):.1f} 班")
-    
-    return schedule
 
+    return schedule
 # ========== 模式A：系统自动生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
     buf = BytesIO()
@@ -349,14 +341,13 @@ def export_pdf_auto(schedule_data, template_name):
     c.save()
     buf.seek(0)
     return buf
-
 # ========== 模式B：填充用户模板 ==========
 def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset_y:int=-30):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     page = doc[0]
     start_x = 158 + offset_x
     start_y = 175 + offset_y
-    
+
     font_title = 6
     font_name = 6
     font_phone = 4.5
@@ -365,12 +356,10 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     gap_phone = 4
     cell_w = 82
     cell_h = 115
-
     cell_dict = {}
     for si in range(3):
         for wi in range(7):
             cell_dict[(si,wi)] = {"stu":[], "wei":[]}
-
     for entry in schedule_data:
         k = (entry["shift_idx"], entry["week_idx"])
         if k in cell_dict:
@@ -378,10 +367,8 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
                 cell_dict[k]["stu"].append( (p["name"], p.get("phone","")) )
             for p in entry["职委"]:
                 cell_dict[k]["wei"].append( (p["name"], p.get("phone","")) )
-
     total_block_height = gap_title + gap_name + gap_phone + gap_name + gap_phone + gap_title + gap_name + gap_phone
     top_pad = (cell_h - total_block_height) // 2
-
     for shift_idx in range(3):
         for week_idx in range(7):
             cell_data = cell_dict[(shift_idx, week_idx)]
@@ -389,11 +376,9 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
             wei_list = cell_data["wei"][0:1]
             pos_x = start_x + week_idx * cell_w + 5
             pos_y = start_y + shift_idx * cell_h + top_pad
-
             cy = pos_y
             page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
             cy += gap_title
-
             for name, phone in stu_list:
                 page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                 cy += gap_name
@@ -402,10 +387,8 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
                     cy += gap_phone
                 else:
                     cy += gap_name
-
             page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
             cy += gap_title
-
             for name, phone in wei_list:
                 page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                 cy += gap_name
@@ -414,13 +397,11 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
                     cy += gap_phone
                 else:
                     cy += gap_name
-
     out_buf = BytesIO()
     doc.save(out_buf)
     doc.close()
     out_buf.seek(0)
     return out_buf
-
 # ========== 页面入口 ==========
 st.set_page_config(page_title="值班排班系统", layout="wide")
 if "login" not in st.session_state:
@@ -435,16 +416,13 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
-
 # 检查URL参数，如果page=self就直接进入自助上传页面
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
-
 if _is_self_page:
     menu = "成员自助上传"
 else:
     menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
-
 if menu == "管理员后台":
     if not st.session_state.login:
         st.title("管理员登录")
@@ -460,17 +438,15 @@ if menu == "管理员后台":
                 st.error("账号或密码错误（默认账号：admin，密码：123456）")
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        
+
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接"])
             tab6 = None
-
         with tab1:
             st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号-课表.pdf）")
             up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
-
             if up_files and st.button("📂 第一步：快速识别姓名、身份、电话，生成预览表格"):
                 with st.spinner("正在本地读取PDF和文件名..."):
                     texts = []
@@ -500,7 +476,6 @@ if menu == "管理员后台":
                     st.session_state.temp_new_member = unique
                 st.success(f"本地识别完成，共 {len(unique)} 人！先在表格里填好个性化需求，再点第二步让AI综合识别。")
                 st.rerun()
-
             if len(st.session_state.temp_new_member) > 0:
                 st.divider()
                 st.subheader("📋 预览表格（先填个性化需求，再点AI识别，AI会综合课表+需求一起算）")
@@ -511,7 +486,6 @@ if menu == "管理员后台":
                     "personal_need": st.column_config.TextColumn("个性化需求（手动填，AI会自动识别各种说法）")
                 }
                 edited_temp = st.data_editor(df_temp, use_container_width=True, column_config=temp_config, num_rows="dynamic", key="temp_editor")
-
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
                     if st.button("🤖 第二步：AI综合识别（课表+个性化需求）"):
@@ -573,7 +547,6 @@ if menu == "管理员后台":
                         st.session_state.temp_new_member = []
                         st.session_state.temp_pdf_texts = []
                         st.rerun()
-
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
             mem = load_members()
@@ -604,7 +577,6 @@ if menu == "管理员后台":
                     save_members([])
                     st.warning("人员库已清空！")
                     st.rerun()
-
         with tab3:
             st.subheader("一键排班（AI综合考虑课表冲突+个性化需求+职委均匀轮班）")
             mlist = load_members()
@@ -615,11 +587,9 @@ if menu == "管理员后台":
                 st.success("排班完成！")
             if st.session_state.schedule_result:
                 st.dataframe(pd.DataFrame(st.session_state.schedule_result), use_container_width=True)
-
         with tab4:
             st.subheader("导出PDF（两种模式任选）")
             mode_sel = st.radio("选择导出模式", ["模式A：系统自动生成值班表", "模式B：上传我的空白模板PDF，自动填充"])
-
             if mode_sel == "模式A：系统自动生成值班表":
                 pdf_template_sel = st.selectbox("PDF样式", TEMPLATE_OPTIONS)
                 if not st.session_state.schedule_result:
@@ -629,7 +599,6 @@ if menu == "管理员后台":
                         with st.spinner("正在生成PDF..."):
                             pdf_buf = export_pdf_auto(st.session_state.schedule_result, pdf_template_sel)
                         st.download_button("下载值班表", pdf_buf, file_name="值班表.pdf", mime="application/pdf")
-
             else:
                 st.info("上传你自己的空白值班表PDF模板，文字块整体缩小居中")
                 user_up = st.file_uploader("上传你的空白值班表PDF模板", type="pdf")
@@ -662,13 +631,10 @@ if menu == "管理员后台":
             st.code(self_link, language="text")
             if st.button("复制链接提示"):
                 st.success("链接已生成，直接复制发给成员即可！")
-
-
-
         if tab6 is not None:
             with tab6:
                 st.subheader("管理员管理（仅超级管理员可见）")
-                
+
                 st.markdown("#### 修改超级管理员账号")
                 old_pwd = st.text_input("原密码", type="password", key="old_pwd_super")
                 new_username = st.text_input("新管理员账号（留空则不修改）", value="", key="new_username_super")
@@ -697,7 +663,7 @@ if menu == "管理员后台":
                             st.session_state.current_admin = new_username.strip()
                         st.success("超级管理员账号信息已更新！")
                         st.rerun()
-                
+
                 st.divider()
                 st.markdown("#### 修改当前账号密码")
                 old_pwd2 = st.text_input("原密码", type="password", key="old_pwd")
@@ -718,7 +684,7 @@ if menu == "管理员后台":
                                 break
                         else:
                             st.error("原密码错误")
-                
+
                 st.divider()
                 st.markdown("#### 添加新管理员")
                 new_admin_user = st.text_input("新管理员账号", key="new_admin_user")
@@ -734,14 +700,14 @@ if menu == "管理员后台":
                         admin_data["admins"].append({"username": new_admin_user, "password": new_admin_pwd, "is_super": False})
                         save_admin(admin_data)
                         st.success(f"管理员 {new_admin_user} 添加成功！")
-                
+
                 st.divider()
                 st.markdown("#### 管理员列表")
                 admin_data = load_admin()
                 df_admin = pd.DataFrame(admin_data["admins"])
                 df_admin["角色"] = df_admin["is_super"].apply(lambda x: "超级管理员" if x else "普通管理员")
                 st.dataframe(df_admin[["username","角色"]], use_container_width=True)
-                
+
                 st.divider()
                 st.markdown("#### 删除管理员")
                 normal_admins = [a["username"] for a in admin_data["admins"] if not a.get("is_super", False)]
@@ -754,12 +720,10 @@ if menu == "管理员后台":
                         st.success(f"管理员 {delete_user} 已删除！")
                 else:
                     st.info("暂无普通管理员可删除")
-
         if st.button("退出登录"):
             st.session_state.login = False
             st.session_state.current_admin = ""
             st.rerun()
-
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
     with st.form("member_form"):
@@ -790,3 +754,4 @@ elif menu == "成员自助上传":
                         all_mem.append({"name":name,"phone":phone,"role":role_sel,"class_conflict":class_conflict,"personal_need":personal_need})
                     save_members(all_mem)
                 st.success("提交成功！AI已综合识别你所有不能值班的时段。")
+v
