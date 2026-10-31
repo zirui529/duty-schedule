@@ -754,4 +754,3 @@ elif menu == "成员自助上传":
                         all_mem.append({"name":name,"phone":phone,"role":role_sel,"class_conflict":class_conflict,"personal_need":personal_need})
                     save_members(all_mem)
                 st.success("提交成功！AI已综合识别你所有不能值班的时段。")
-v
