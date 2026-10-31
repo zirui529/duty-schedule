@@ -143,120 +143,96 @@ def parse_filename_phone_and_role(filename):
     return role, phone
 
 # ========== AI综合解析 ==========
+# ========== AI综合解析 ==========
+def _call_ai_raw(prompt_text):
+    headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL_ID,
+        "messages": [
+            {"role":"system","content":"你是大学课表分析专家，只输出JSON数组，不输出任何解释、说明、markdown标记。"},
+            {"role":"user","content": prompt_text}
+        ],
+        "temperature":0.0,
+        "max_tokens":800,
+        "service_tier":"default"
+    }
+    resp = get_session().post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    res = resp.json()
+    out = res["choices"][0]["message"]["content"].strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```[a-z]*\n?", "", out)
+        out = re.sub(r"\n?```$", "", out)
+    _match = re.search(r'\[.*\]', out, re.DOTALL)
+    if _match:
+        out = _match.group()
+    arr = json.loads(out)
+    _processed = []
+    for _item in arr:
+        if isinstance(_item, dict):
+            _processed.append(str(list(_item.values())[0]))
+        else:
+            _processed.append(str(_item))
+    return _processed
+
+
 def fast_ai_extract(text:str, personal_need:str=""):
     if not text or len(text.strip()) < 10:
         return "课表文本提取失败，请手动填写"
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
-    
-    def call_ai(prompt_text):
-        payload = {
-            "model": MODEL_ID,
-            "messages": [
-                {"role":"system","content":"你是大学课表分析专家，擅长从PDF提取的混乱表格文本中准确识别每天的课程安排。你只输出JSON数组，不输出任何解释。"},
-                {"role":"user","content": prompt_text}
-            ],
-            "temperature":0.0,
-            "max_tokens":800,
-            "service_tier":"default"
-        }
-        resp = get_session().post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
-        res = resp.json()
-        out = res["choices"][0]["message"]["content"].strip()
-        if out.startswith("```"):
-            out = re.sub(r"^```[a-z]*\n?", "", out)
-            out = re.sub(r"\n?```$", "", out)
-        # 用正则提取JSON数组，不管AI前面加了什么解释文字
-        import re as _re
-        _match = _re.search(r'\[.*\]', out, _re.DOTALL)
-        if _match:
-            out = _match.group()
-        return out
 
-    personal_section = ""
-    if personal_need and personal_need != "无":
-        personal_section = f"""
-同时这个人还有个性化需求：{personal_need}
-请仔细理解个性化需求，把所有不能值班的时段都加进数组：
-- 如果说"X时间有事/不值班/不能来/要上课/回家/请假" → X时间加进数组
-- 如果说"只在X时间有空/只能X时间值班" → 除了X时间以外，其他所有时段都加进数组
-- 如果说"周末不值班/周末有事" → 周六上午、周六下午、周六晚上、周日上午、周日下午、周日晚上都加进数组
-- 如果说"周X下午有空" → 除了周X下午，其他所有时段都加进数组
-- 如果说"晚上不值班" → 周一晚上、周二晚上、周三晚上、周四晚上、周五晚上、周六晚上、周日晚上都加进数组
-"""
+    # 步骤1：仅解析课表，只获取上课冲突，完全不碰个性化需求
+    prompt_course = f"""请分析下面大学课表文本，只输出【因为上课不能值班】的时段字符串数组。
+值班全部候选时段列表：
+["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
 
-    prompt1 = f"""请分析下面的大学课表文本，找出这个人所有不能值班的时段。
+值班与节次对应规则：
+- 上午班（9:00‑13:00）冲突：第2、3、4、5节有课就算（第1节8:45下课，不算）
+- 下午班（13:00‑17:00）冲突：第6、7、8、9节有课就算
+- 晚上班（17:00‑20:00）冲突：第9、10、11、12节有课就算（第13节20:10开始，不算）
 
-值班时段共21个，你必须逐个检查，一个都不能漏：
-周一上午、周一下午、周一晚上、周二上午、周二下午、周二晚上、周三上午、周三下午、周三晚上、周四上午、周四下午、周四晚上、周五上午、周五下午、周五晚上、周六上午、周六下午、周六晚上、周日上午、周日下午、周日晚上
+重要规则：
+1. 只识别【上课】导致不能值班的时段；不要脑补、不要加入任何个人请假、有事类限制；
+2. 逐天检查上午、下午、晚上，晚上课程容易遗漏，PDF课表晚上课程常在页面底部，务必读完全文；
+3. 输出严格是字符串JSON数组，例如["周一上午","周二晚上"]，无其他文字；
 
-判断规则（必须严格遵守）：
-【上午班冲突】上午有课就算 = 表格里上午区域（一般是前5节课）当天有任何课
-【下午班冲突】下午有课就算 = 表格里下午区域（一般是中间几节课）当天有任何课
-【晚上班冲突】晚上有课就算 = 表格里下午晚些时候或傍晚/晚上区域（一般是靠后的几节课）当天有任何课
-
-具体节次对应：
-- 上午班（9:00-13:00）冲突：第2、3、4、5节有课就算（第1节8:45下课，不算）
-- 下午班（13:00-17:00）冲突：第6、7、8、9节有课就算
-- 晚上班（17:00-20:00）冲突：第9、10、11、12节有课就算（第13节20:10开始，不算）
-
-⚠️ 特别提醒（非常重要，必须逐条遵守）：
-1. 晚上的课最容易被漏掉！请你从头到尾通读课表文本，不要只看前半部分！
-2. 很多PDF课表的晚上课排在表格下方，甚至单独一行，很容易被忽略！
-3. 对每一天，都要分别确认：上午有没有课？下午有没有课？晚上有没有课？
-4. 只要那天下午的课排得比较靠后（超过3节），就要检查晚上是不是也有课！
-5. 不要因为"晚上应该没课"就跳过，必须以课表文本为准！
-6. 不要只找"第9节""第10节"这样的标注！如果表格里傍晚、晚上、晚些时候有课，就算晚上班冲突！
-7. 如果你不确定某天晚上有没有课，就宁可加进去，也不要漏掉！
-
-只输出纯字符串组成的JSON数组，例如：["周一上午", "周一下午", "周三晚上"]
-不要输出对象、键值对、字典格式，数组里每个元素必须是纯字符串。
-不要任何解释文字，不要markdown代码块。
-{personal_section}
-
-课表文本如下（可能有多张表、多页内容，请全部看完，不要只看前半部分）：
-{text[:8000]}"""
-
-    try:
-        out1 = call_ai(prompt1)
-        arr1 = json.loads(out1)
-        # 兼容AI返回dict数组的情况，统一转成字符串
-        _processed = []
-        for _item in arr1:
-            if isinstance(_item, dict):
-                _processed.append(str(list(_item.values())[0]))
-            else:
-                _processed.append(str(_item))
-        arr1 = _processed
-        if len(arr1) < 2:
-            prompt2 = f"""重新检查一遍！重点检查每天下午和晚上有没有漏掉的课！
-已经识别出的不能值班的时段：{arr1}
-请逐天核对周一到周日，每天分别确认：
-- 上午班（第2、3、4、5节）有没有课？
-- 下午班（第6、7、8、9节）有没有课？
-- 晚上班（第9、10、11、12节）有没有课？
-不要漏掉任何下午和晚上的课！
-还是只输出完整的JSON数组（包含所有不能值班的时段），不要解释。
-{personal_section}
 课表文本：
-{text[:8000]}"""
-            out2 = call_ai(prompt2)
-            arr2 = json.loads(out2)
-            # 兼容AI返回dict数组的情况
-            _processed2 = []
-            for _item in arr2:
-                if isinstance(_item, dict):
-                    _processed2.append(str(list(_item.values())[0]))
-                else:
-                    _processed2.append(str(_item))
-            arr2 = _processed2
-            combined = list(set(arr1 + arr2))
-            arr1 = combined
-        if isinstance(arr1, list) and len(arr1) > 0:
-            return "、".join(arr1)
-        else:
-            return "识别为空，请手动检查"
+{text[:8000]}
+"""
+    try:
+        course_conflict_list = _call_ai_raw(prompt_course)
     except Exception as e:
-        return f"识别失败: {str(e)[:60]}"
+        return f"课表识别失败:{str(e)[:60]}"
+
+    # 步骤2：只解析个性化需求，仅允许追加，禁止修改课表结果
+    personal_conflict_list = []
+    if personal_need and personal_need.strip() not in ("","无"):
+        prompt_personal = f"""
+已有课表识别出来因上课不能值班的时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
+用户个性化需求：{personal_need}
+
+任务：仅根据【个性化需求】提取额外新增的不能值班时段。
+硬性约束（必须严格执行）：
+1. 你只能输出因个人有事、会议、请假等【额外新增】的禁止值班时段；
+2. ❗严禁修改、删除、扩大上面课表给出的冲突/空闲结果；绝对不能把课表里空闲无事由的时段加入禁止列表；
+3. 只处理个性化描述，不要重新分析课表内容；
+4. 如果需求没有产生任何额外限制，返回空数组 []
+5. 输出格式：纯字符串JSON数组，不要任何解释。
+
+示例：
+课表冲突：["周四上午"]；需求：周四下午骨干会跟会 → 输出 ["周四下午"]
+课表冲突：["周一上午"]；需求：无 → 输出 []
+"""
+        try:
+            personal_conflict_list = _call_ai_raw(prompt_personal)
+        except Exception:
+            personal_conflict_list = []
+
+    total_conflict = list(set(course_conflict_list + personal_conflict_list))
+    if len(total_conflict) > 0:
+        return "、".join(total_conflict)
+    else:
+        return "识别为空，请手动检查"
+
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
