@@ -261,6 +261,7 @@ def fast_ai_extract(text:str, personal_need:str=""):
         return "识别为空，请手动填写"
     return "、".join(sorted(total))
 
+
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
     class_conflict = safe_str(member.get("class_conflict"))
