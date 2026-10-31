@@ -19,7 +19,7 @@ DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
-# 火山方舟配置，从Streamlit Secrets读取
+# 火山方舟配置，只读取secrets，不硬编码密钥
 try:
     VOLC_API_KEY = st.secrets["ARK_API_KEY"]
     VOLC_ENDPOINT = st.secrets["ARK_ENDPOINT"]
@@ -27,6 +27,7 @@ try:
 except KeyError:
     st.error("缺少火山方舟密钥，请在Streamlit Settings -> Secrets配置ARK_API_KEY、ARK_ENDPOINT、ARK_MODEL_ENDPOINT_ID")
     st.stop()
+
 API_TIMEOUT = 30
 MAX_RETRY = 0
 MAX_WORKERS = 4
@@ -136,20 +137,24 @@ def parse_filename_phone_and_role(filename):
     return role, phone
 
 # ========== AI底层调用 两套独立接口 ==========
-# ========== AI底层调用 两套独立接口 ==========
 def _call_course_ai(prompt_text):
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL_ID,
         "messages": [
             {"role": "system", "content": """
-你是课表提取器，严格只输出JSON数组，禁止额外文字、解释、markdown。
-规则：
-1. 只提取课表里存在的【星期+节次编号】，节次编号只能是1~13的数字。
-2. 星期只能是：周一、周二、周三、周四、周五、周六、周日。
-3. 没有课的星期，不要写进数组里面。
-4. 输出格式固定：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
-5. 绝对不要编造课，原文没有的星期、节次不要写。
+你是课表提取工具，**只输出JSON数组，绝对不能输出任何说明、注释、markdown、```符号**。
+下面是本系统全部节次标准时间，严格参照：
+1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
+6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
+10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
+
+⚠️极高优先级强制约束：
+1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。
+2、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
+3、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
+4、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
+5、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
 """},
             {"role": "user", "content": prompt_text}
         ],
@@ -162,7 +167,7 @@ def _call_course_ai(prompt_text):
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("模型没有返回合法数组")
+        raise ValueError("模型没有返回合法JSON数组")
     arr = json.loads(match.group(0))
     return arr
 
@@ -172,9 +177,9 @@ def _call_personal_ai(prompt_text):
         "model": MODEL_ID,
         "messages": [
             {"role": "system", "content": """
-只输出JSON字符串数组，内容是【周X上午/下午/晚上】，只能追加，不能删除课表已经算出的冲突。
-没有额外限制就返回空数组[]。
-示例：["周日上午","周二晚上"]
+只输出JSON字符串数组，内容是【周X上午/下午/晚上】，只能追加，不能删除课表算出的冲突。
+无额外限制返回空数组[]。示例：["周日上午","周二晚上"]
+禁止markdown、禁止解释文字。
 """},
             {"role": "user", "content": prompt_text}
         ],
@@ -189,7 +194,7 @@ def _call_personal_ai(prompt_text):
     if not match:
         return []
     arr = json.loads(match.group(0))
-    return [s.strip() for s in arr if isinstance(s,str)]
+    return [s.strip() for s in arr if isinstance(s, str)]
 
 # 【节次精确时间（分钟，从0点起算）】
 SECTION_TIME = {
@@ -207,17 +212,8 @@ SECTION_TIME = {
     12:(19*60+20,20*60+5),
     13:(20*60+10,20*60+55)
 }
-# 值班班次时间
-SHIFT_TIME = {
-    "上午": (9*60, 13*60),
-    "下午": (13*60,17*60),
-    "晚上": (17*60,20*60)
-}
 
-def is_time_overlap(a_start,a_end,b_start,b_end):
-    # 区间重叠判断
-    return not (a_end <= b_start or a_start >= b_end)
-
+# ==========新版冲突计算：课程【开始时间】唯一归属班次，消除跨时段双重冲突==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
     for item in ai_course_data:
@@ -226,10 +222,14 @@ def calc_course_conflict(ai_course_data):
         for s in secs:
             if s not in SECTION_TIME:
                 continue
-            c_start, c_end = SECTION_TIME[s]
-            for shift_name, (sh_start, sh_end) in SHIFT_TIME.items():
-                if is_time_overlap(c_start,c_end,sh_start,sh_end):
-                    conflict.add(f"{w}{shift_name}")
+            c_start, _ = SECTION_TIME[s]
+            if c_start < 13 * 60:
+                shift_name = "上午"
+            elif c_start < 17 * 60:
+                shift_name = "下午"
+            else:
+                shift_name = "晚上"
+            conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
 def fast_ai_extract(text:str, personal_need:str=""):
@@ -241,6 +241,25 @@ def fast_ai_extract(text:str, personal_need:str=""):
 """
     try:
         ai_course_data = _call_course_ai(prompt_course)
+        # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
+        valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
+        valid_sections = set(range(1,14))
+        cleaned_data = []
+        for entry in ai_course_data:
+            if not isinstance(entry,dict):
+                continue
+            w = entry.get("week","")
+            sec_list = entry.get("sections",[])
+            if w not in valid_weeks:
+                continue
+            clean_sec = [x for x in sec_list if isinstance(x,int) and x in valid_sections]
+            if len(clean_sec)>0:
+                cleaned_data.append({"week":w,"sections":clean_sec})
+        ai_course_data = cleaned_data
+        # DEBUG折叠面板，仅streamlit页面环境输出
+        if st.runtime.exists():
+            with st.expander("🔍DEBUG AI读取原始课表(仅管理员批量上传可见)"):
+                st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
@@ -260,7 +279,6 @@ def fast_ai_extract(text:str, personal_need:str=""):
     if not total:
         return "识别为空，请手动填写"
     return "、".join(sorted(total))
-
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -440,8 +458,6 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
-
-# 检查URL参数，如果page=self就直接进入自助上传页面
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
 if _is_self_page:
