@@ -122,8 +122,7 @@ def parse_filename_phone_and_role(filename):
         if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
             phone = phone_candidate
     return role, phone
-
-# ========== AI综合解析【修复版本】 ==========
+# ========== AI综合解析【修复时间重叠规则版本】 ==========
 def _call_ai_raw(prompt_text):
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -139,16 +138,12 @@ def _call_ai_raw(prompt_text):
     resp = get_session().post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     res = resp.json()
     out = res["choices"][0]["message"]["content"].strip()
-
     out = re.sub(r"^```[a-zA-Z]*\s*", "", out)
     out = re.sub(r"\s*```$", "", out)
-
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
         raise ValueError("模型未返回有效数组")
-
     arr = json.loads(match.group())
-
     result = []
     for item in arr:
         if isinstance(item, str):
@@ -159,59 +154,62 @@ def _call_ai_raw(prompt_text):
                     result.append(v.strip())
         else:
             result.append(str(item))
-
     seen = set()
     result = [x for x in result if not (x in seen or seen.add(x))]
     return result
 
-
 def fast_ai_extract(text:str, personal_need:str=""):
     if not text or len(text.strip()) < 10:
         return "课表文本提取失败，请手动填写"
+    prompt_course = f"""
+【值班班次时间窗口】
+上午班：09:00‑13:00
+下午班：13:00‑17:00
+晚上班：17:00‑20:00
 
-    # 步骤1：只识别课表冲突，不处理个性化需求
-    prompt_course = f"""请分析下面大学课表文本，只输出【因为上课不能值班】的时段字符串数组。
+【课程每节真实时间】
+1节 08:00‑08:45
+2节 08:50‑09:35
+3节 09:50‑10:35
+4节 10:40‑11:25
+5节 11:30‑12:15
+6节 14:05‑14:50
+7节 14:55‑15:40
+8节 15:45‑16:30
+9节 16:40‑17:25
+10节 17:30‑18:15
+11节 18:30‑19:15
+12节 19:20‑20:05
+13节 20:10‑20:55
 
-只检查以下候选时段：
-["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上"]
+【核心判定铁则，必须严格遵守】
+1. 只有【课程时间段】和【值班班次时间段】存在时间重叠，才把该「星期+班次」加入冲突数组；
+2. 课程完全早于班次开始、或者课程完全晚于班次结束，绝对不要加入冲突；
+3. 例子：第13节20:10‑20:55，晚班20:00结束，二者无重叠 → 晚上班不冲突，不要加入；
+4. 例子：第9节16:40‑17:25，和下午班、晚上班均有重叠 → 下午、晚上都要加入冲突；
+5. 逐天逐班次完整检查，不能漏；
+6. 只输出上课导致冲突的["周一上午","周一下午"...]字符串JSON数组，不要任何解释。
 
-值班与节次对应规则：
-- 上午班（9:00‑13:00）冲突：第2、3、4、5节有课就算
-- 下午班（13:00‑17:00）冲突：第6、7、8、9节有课就算
-- 晚上班（17:00‑20:00）冲突：第9、10、11、12节有课就算
-
-严格要求：
-1. 只输出上课导致的冲突；
-2. 逐天逐段判断，不能遗漏；
-3. 有课的时段必须加入；
-4. 无课的时段绝对不能加入；
-5. 输出严格为字符串JSON数组，不要解释。
-
-课表文本：
+课表文本（可能有多张表、多页内容，请全部看完，不要只看前半部分）：
 {text[:8000]}
 """
     try:
         course_conflict_list = _call_ai_raw(prompt_course)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
-
     # 步骤2：只识别个性化追加冲突，不允许修改课表结果
     personal_conflict_list = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
 已有课表冲突时段：{json.dumps(course_conflict_list, ensure_ascii=False)}
-
 用户个性化需求：{personal_need}
-
 任务：只根据个性化需求，额外增加不能值班的时段。
-
 硬性规则：
 1. 只能新增个性化需求明确提到的时段；
 2. 绝对不能修改、删除、复制课表已有冲突；
 3. 绝对不能把课表里没有课的时段加进来；
 4. 如果没有额外限制，返回 []；
 5. 输出严格为字符串JSON数组，不要解释。
-
 示例：
 输入：周四下午骨干会跟会
 输出：["周四下午"]
@@ -220,12 +218,9 @@ def fast_ai_extract(text:str, personal_need:str=""):
             personal_conflict_list = _call_ai_raw(prompt_personal)
         except Exception:
             personal_conflict_list = []
-
     total_conflict = list(set(course_conflict_list + personal_conflict_list))
-
     if not total_conflict:
         return "识别为空，请手动检查"
-
     return "、".join(total_conflict)
 
 # ========== 判断某人在某时段是否有空 ==========
@@ -241,23 +236,18 @@ def is_available(member, week_idx, shift_idx):
 def smart_schedule(member_list):
     stu_pool = [m for m in member_list if m["role"]=="学员"]
     wei_pool = [m for m in member_list if m["role"]=="职委"]
-
     st.info(f"📊 人员统计：学员 {len(stu_pool)} 人，职委 {len(wei_pool)} 人")
     if len(wei_pool) == 0:
         st.error("⚠️ 警告：人员库里没有职委！请去「人员库管理」把需要当职委的人身份改成「职委」")
-
     random.shuffle(stu_pool)
     random.shuffle(wei_pool)
-
     all_slots = []
     for w_idx, w in enumerate(WEEK_NAMES):
         for s_idx, s in enumerate(SHIFT_LIST):
             all_slots.append({"week_idx":w_idx, "shift_idx":s_idx, "week":w, "shift":s["shift_name"]})
-
     stu_count = {m["name"]:0 for m in stu_pool}
     wei_count = {m["name"]:0 for m in wei_pool}
     schedule = []
-
     slots_remaining = all_slots.copy()
     for slot in slots_remaining:
         w_idx = slot["week_idx"]
@@ -265,7 +255,6 @@ def smart_schedule(member_list):
         need_stu = SHIFT_LIST[s_idx]["need_stu"]
         slot["学员"] = []
         slot["职委"] = []
-
         available_stu = [m for m in stu_pool if is_available(m, w_idx, s_idx) and stu_count[m["name"]] < 1]
         if len(available_stu) < need_stu:
             for m in stu_pool:
@@ -275,7 +264,6 @@ def smart_schedule(member_list):
             p = available_stu[i]
             slot["学员"].append(p)
             stu_count[p["name"]] += 1
-
     if wei_pool:
         wei_cycle = wei_pool.copy()
         wei_ptr = 0
@@ -283,7 +271,6 @@ def smart_schedule(member_list):
             w_idx = slot["week_idx"]
             s_idx = slot["shift_idx"]
             need_wei = SHIFT_LIST[s_idx]["need_wei"]
-
             picked = False
             for _ in range(len(wei_cycle)):
                 candidate = wei_cycle[wei_ptr % len(wei_cycle)]
@@ -293,7 +280,6 @@ def smart_schedule(member_list):
                     wei_count[candidate["name"]] += 1
                     picked = True
                     break
-
             if not picked:
                 available_wei = [m for m in wei_pool if is_available(m, w_idx, s_idx)]
                 if available_wei:
@@ -303,16 +289,12 @@ def smart_schedule(member_list):
                 else:
                     slot["职委"].append(wei_pool[0])
                     wei_count[wei_pool[0]["name"]] += 1
-
             schedule.append(slot)
-
     rested = [name for name, cnt in stu_count.items() if cnt == 0]
     if rested:
         st.info(f"ℹ️ 本周共 {len(rested)} 名学员轮空：{'、'.join(rested)}")
-
     if wei_pool:
         st.success(f"✅ 职委排班完成：共 {len(wei_pool)} 名职委，平均每人排 {sum(wei_count.values())/len(wei_pool):.1f} 班")
-
     return schedule
 # ========== 模式A：系统自动生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
@@ -347,7 +329,6 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     page = doc[0]
     start_x = 158 + offset_x
     start_y = 175 + offset_y
-
     font_title = 6
     font_name = 6
     font_phone = 4.5
@@ -438,7 +419,6 @@ if menu == "管理员后台":
                 st.error("账号或密码错误（默认账号：admin，密码：123456）")
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -634,7 +614,6 @@ if menu == "管理员后台":
         if tab6 is not None:
             with tab6:
                 st.subheader("管理员管理（仅超级管理员可见）")
-
                 st.markdown("#### 修改超级管理员账号")
                 old_pwd = st.text_input("原密码", type="password", key="old_pwd_super")
                 new_username = st.text_input("新管理员账号（留空则不修改）", value="", key="new_username_super")
@@ -663,7 +642,6 @@ if menu == "管理员后台":
                             st.session_state.current_admin = new_username.strip()
                         st.success("超级管理员账号信息已更新！")
                         st.rerun()
-
                 st.divider()
                 st.markdown("#### 修改当前账号密码")
                 old_pwd2 = st.text_input("原密码", type="password", key="old_pwd")
@@ -684,7 +662,6 @@ if menu == "管理员后台":
                                 break
                         else:
                             st.error("原密码错误")
-
                 st.divider()
                 st.markdown("#### 添加新管理员")
                 new_admin_user = st.text_input("新管理员账号", key="new_admin_user")
@@ -700,14 +677,12 @@ if menu == "管理员后台":
                         admin_data["admins"].append({"username": new_admin_user, "password": new_admin_pwd, "is_super": False})
                         save_admin(admin_data)
                         st.success(f"管理员 {new_admin_user} 添加成功！")
-
                 st.divider()
                 st.markdown("#### 管理员列表")
                 admin_data = load_admin()
                 df_admin = pd.DataFrame(admin_data["admins"])
                 df_admin["角色"] = df_admin["is_super"].apply(lambda x: "超级管理员" if x else "普通管理员")
                 st.dataframe(df_admin[["username","角色"]], use_container_width=True)
-
                 st.divider()
                 st.markdown("#### 删除管理员")
                 normal_admins = [a["username"] for a in admin_data["admins"] if not a.get("is_super", False)]
