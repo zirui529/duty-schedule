@@ -7,6 +7,7 @@ import re
 import random
 from io import BytesIO
 import requests
+import dashscope
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -21,18 +22,14 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 
-# --------【固定分工】--------
-# qwen‑max(DashScope): 接收PDF提取文本，解析课表输出week+sections JSON，抗幻觉，负责课表识别
-# doubao2.1‑seed‑pro(火山方舟): 仅解析用户个性化额外禁止值班需求，关闭深度思考防止脑补
 try:
-    # 火山方舟：个性化需求解析
+    # 火山方舟：仅个性化需求解析
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
     ARK_MODEL = st.secrets["ark"]["model_name"]
-    # 阿里云DashScope qwen‑max 课表解析
+    # 阿里云dashscope原生，课表解析 qwen‑max‑latest
     DS_API_KEY = st.secrets["dashscope"]["api_key"]
-    DS_ENDPOINT = st.secrets["dashscope"]["endpoint"]
-    DS_MODEL = st.secrets["dashscope"]["model_name"]
+    dashscope.api_key = DS_API_KEY
 except KeyError:
     st.error("secrets必须配置[ark]、[dashscope]两组密钥")
     st.stop()
@@ -145,7 +142,7 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== 提示词【重点：严厉禁止脑补、禁止推测，没有原文依据绝对不能输出】 ======================
+# ====================== 提示词【严厉禁止脑补】 ======================
 EXTRACT_SYS_PROMPT = """
 你是严谨课表提取工具。
 ⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！没有原文证据就不要输出，宁可返回空数组。**
@@ -153,8 +150,8 @@ EXTRACT_SYS_PROMPT = """
 1.星期只能：周一、周二、周三、周四、周五、周六、周日，不允许简写。
 2.节次只允许1‑13整数，其余全部丢弃。
 3.输出字段仅允许week、sections，不能增加任何别的key。
-4.某星期完全无课，该星期不要写进数组。
-5.只输出纯净JSON数组，禁止```、注释、说明、markdown、任何解释文字。
+4.某星期完全无课，该星期不要写入数组。
+5.只输出纯净JSON数组，禁止```、注释、markdown、任何解释文字。
 
 节次参考：
 1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
@@ -162,7 +159,6 @@ EXTRACT_SYS_PROMPT = """
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
 
 ✅正确示例：[{"week":"周一","sections":[1,3]},{"week":"周六","sections":[11]}]
-❌严禁：原文没课自己凭空加课。
 """
 
 PERSONAL_SYS_PROMPT = """
@@ -183,23 +179,21 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# ==========【千问qwen‑max】课表结构化解析，接收PDF提取后的文本 ==========
+# ==========【千问 qwen‑max‑latest 原生dashscope SDK调用，不再用兼容接口，规避400】 =========
 def _call_course_ai(prompt_text:str):
-    sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
-    url = DS_ENDPOINT.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": DS_MODEL,
-        "messages": [
+    resp = dashscope.Generation.call(
+        model="qwen-max-latest",
+        messages=[
             {"role":"system","content":EXTRACT_SYS_PROMPT},
             {"role":"user","content":prompt_text}
         ],
-        "temperature":0,
-        "max_tokens":2000
-    }
-    resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    out = resp.json()["choices"][0]["message"]["content"].strip()
+        temperature=0.0,
+        max_tokens=2000,
+        result_format="message"
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"千问API异常 code:{resp.status_code} {resp.message}")
+    out = resp.output.choices[0].message.content.strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
@@ -220,7 +214,7 @@ def _call_personal_ai(prompt_text:str):
         ],
         "temperature":0,
         "max_tokens":1000,
-        "extra_body":{"thinking":{"type":"disabled"}} #关闭深度思考，杜绝瞎推理脑补
+        "extra_body":{"thinking":{"type":"disabled"}}
     }
     resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
@@ -283,7 +277,6 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
         valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
         valid_sections = set(range(1,14))
         cleaned_data = []
-        #====【本地硬校验屏障，过滤AI幻觉输出】====
         for entry in ai_course_data:
             if not isinstance(entry,dict):
                 continue
@@ -297,7 +290,7 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
         ai_course_data = cleaned_data
 
         if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑max；个性化模型：doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑max‑latest；个性化模型：doubao2.1‑seed‑pro"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
@@ -526,7 +519,7 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("课表解析：qwen‑max；个性化解析：doubao2.1‑seed‑pro｜关闭豆包深度思考防脑补，本地后置校验过滤幻觉")
+        st.caption("课表解析：qwen‑max‑latest；个性化解析：doubao2.1‑seed‑pro｜原生dashscope SDK，规避兼容模式400报错")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -609,7 +602,7 @@ if menu == "管理员后台":
                                 row["phone"] = safe_str(row.get("phone"))
                                 row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
                             st.session_state.temp_new_member = current_rows
-                            st.success("AI识别完成，请点开DEBUG面板核对原始课表JSON，防止AI幻觉脑补课程")
+                            st.success("AI识别完成，请点开DEBUG面板核对原始课表JSON")
                             st.rerun()
                         else:
                             st.info("所有人都已识别，不需要AI！")
@@ -809,7 +802,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("课表解析：qwen‑max；个性化解析：doubao2.1‑seed‑pro｜关闭豆包深度思考防脑补")
+    st.caption("课表解析：qwen‑max‑latest；个性化解析：doubao2.1‑seed‑pro｜原生dashscope SDK")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
