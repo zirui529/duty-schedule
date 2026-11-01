@@ -247,6 +247,7 @@ SECTION_TIME = {
 # ==========【新版业务冲突计算】课程完全在班次结束之后开课，则不判定冲突 ==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
+    debug_detail = []
     for item in ai_course_data:
         w = item["week"]
         secs = item["sections"]
@@ -256,11 +257,27 @@ def calc_course_conflict(ai_course_data):
             c_start, c_end = SECTION_TIME[s]
             for shift_name, (sh_start, sh_end) in SHIFT_TIME_MIN.items():
                 # 规则：课程全部在班次前结束 OR 课程全部在班次结束之后才开始 → 不冲突
-                if not (c_end <= sh_start or c_start >= sh_end):
+                hit = not (c_end <= sh_start or c_start >= sh_end)
+                debug_detail.append({
+                    "week":w,
+                    "section":s,
+                    "c_start_min":c_start,
+                    "c_end_min":c_end,
+                    "shift":shift_name,
+                    "sh_start":sh_start,
+                    "sh_end":sh_end,
+                    "is_conflict": hit
+                })
+                if hit:
                     conflict.add(f"{w}{shift_name}")
-    return sorted(list(conflict))
+    return sorted(list(conflict)), debug_detail
+
 
 def fast_ai_extract(text:str, personal_need:str=""):
+    debug_html = ""
+    debug_json_str = ""
+    debug_calc_detail = []
+    final_conflict_str = ""
     if not text or len(text.strip()) < 10:
         return "课表文本提取失败，请手动填写"
     prompt_course = f"""
@@ -285,18 +302,9 @@ def fast_ai_extract(text:str, personal_need:str=""):
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
 
-        # ---------------- 测试DEBUG：强制打印到Mac终端 ----------------
-        print("\n==========【AI原始课表JSON】==========")
-        print(json.dumps(ai_course_data, ensure_ascii=False, indent=2))
-        print("======================================\n")
-        # --------------------------------------------------------
+        debug_json_str = json.dumps(ai_course_data, ensure_ascii=False, indent=2)
+        course_conflict, debug_calc_detail = calc_course_conflict(ai_course_data)
 
-        # 网页折叠DEBUG面板
-        if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表(仅管理员批量上传可见)"):
-                st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
-
-        course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
 
@@ -311,8 +319,16 @@ def fast_ai_extract(text:str, personal_need:str=""):
             personal_conflict = []
     total = list(set(course_conflict + personal_conflict))
     if not total:
-        return "识别为空，请手动填写"
-    return "、".join(sorted(total))
+        final_conflict_str = "识别为空，请手动填写"
+    else:
+        final_conflict_str = "、".join(sorted(total))
+
+    # -------- 把调试信息存入st.session_state，页面上渲染 --------
+    st.session_state["debug_ai_raw_json"] = debug_json_str
+    st.session_state["debug_calc_steps"] = debug_calc_detail
+    st.session_state["debug_final_conflict"] = final_conflict_str
+
+    return final_conflict_str
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -492,6 +508,13 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
+if "debug_ai_raw_json" not in st.session_state:
+    st.session_state.debug_ai_raw_json = ""
+if "debug_calc_steps" not in st.session_state:
+    st.session_state.debug_calc_steps = []
+if "debug_final_conflict" not in st.session_state:
+    st.session_state.debug_final_conflict = ""
+
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
 if _is_self_page:
@@ -622,6 +645,20 @@ if menu == "管理员后台":
                         st.session_state.temp_new_member = []
                         st.session_state.temp_pdf_texts = []
                         st.rerun()
+
+                # ========== 网页直接渲染全部调试信息 ==========
+                st.divider()
+                st.subheader("🔍DEBUG调试信息（网页直接看，无需终端）")
+                if st.session_state.get("debug_ai_raw_json"):
+                    st.markdown("**1.AI输出原始课表JSON**")
+                    st.code(st.session_state["debug_ai_raw_json"], language="json")
+                if st.session_state.get("debug_calc_steps"):
+                    st.markdown("**2.逐条课→班次冲突运算过程**")
+                    st.dataframe(st.session_state["debug_calc_steps"])
+                if st.session_state.get("debug_final_conflict"):
+                    st.markdown("**3.最终输出冲突字符串**")
+                    st.text(st.session_state["debug_final_conflict"])
+
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
             mem = load_members()
