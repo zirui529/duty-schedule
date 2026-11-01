@@ -39,7 +39,7 @@ SHIFT_LIST = [
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":2,"shift_name": "17:00‑20:00", "need_stu": 2, "need_wei": 1}
 ]
-WEEK_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
 ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
@@ -114,35 +114,18 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ==========【新版：基于页面坐标解析课表，不再使用find_tables，规避合并单元格漂移】 ==========
+# ========== PDF读取：读取全部文字，不做坐标切割，保证不漏课 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    page_w = page.rect.width
-    page_h = page.rect.height
-    words = page.get_text("words")
-    # 7列星期横向划分：周日｜周一｜周二｜周三｜周四｜周五｜周六
-    col_width = page_w / 7.0
-    week_buckets = {w: [] for w in WEEK_NAMES}
-
-    for w_item in words:
-        x0, y0, x1, y1, txt = w_item[0], w_item[1], w_item[2], w_item[3], w_item[4]
-        txt = safe_str(txt)
-        if not txt:
-            continue
-        col_idx = int(x0 / col_width)
-        if 0 <= col_idx < 7:
-            week_name = WEEK_NAMES[col_idx]
-            week_buckets[week_name].append((-y0, txt))
-
-    output_lines = []
-    for w_name in WEEK_NAMES:
-        items = week_buckets[w_name]
-        items.sort()
-        chunk_text = " ".join([i[1] for i in items])
-        output_lines.append(f"【{w_name}】:{chunk_text}")
+    output_parts = []
+    for page in doc:
+        words = page.get_text("words")
+        for w in words:
+            chunk = safe_str(w[4])
+            if chunk:
+                output_parts.append(chunk)
     doc.close()
-    return "\n".join(output_lines)
+    return "\n".join(output_parts)
 
 def get_session():
     session = requests.Session()
@@ -183,9 +166,9 @@ def _call_course_ai(prompt_text):
 6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
 ⚠️极高优先级强制约束：
-1、**没有在【XX】标记块下面文本明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。文本没有出现，就当作没有课。
-2、⚠️极其重要：各个星期完全互相独立！【周日】块的课程只属于周日，【周一】只属于周一，**严禁把A星期块内看到的节次挪到B星期！**
-3、星期只能是：周日、周一、周二、周三、周四、周五、周六；节次只能1‑13的整数，其他数字一律丢弃。
+1、**没有在当前星期标题下方明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止把其他星期的课程搬运过来！**
+2、不同星期课程互相独立！只把该星期标题下面出现的课分配给该星期。看到周一的课程，不能分配到周二/周三等其他星期。
+3、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
 4、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
 5、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
 6、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
@@ -281,16 +264,17 @@ def fast_ai_extract(text:str, personal_need:str=""):
     debug_json_str = ""
     debug_calc_detail = []
     final_conflict_str = ""
+    suspect_warn = []
     if not text or len(text.strip()) < 10:
-        return {"result": "课表文本提取失败，请手动填写", "debug_json": "", "debug_calc": []}
+        return {"result": "课表文本提取失败，请手动填写", "debug_json": "", "debug_calc": [], "suspect_warn":[]}
     prompt_course = f"""
-下面是课表原文，每个星期内容被【星期名称】标记隔离：
+下面是课表原文，提取里面所有星期和节次：
 {text[:8000]}
 """
     try:
         ai_course_data = _call_course_ai(prompt_course)
         # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
-        valid_weeks = {"周日","周一","周二","周三","周四","周五","周六"}
+        valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
         valid_sections = set(range(1,14))
         cleaned_data = []
         for entry in ai_course_data:
@@ -305,11 +289,22 @@ def fast_ai_extract(text:str, personal_need:str=""):
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
 
+        # 可疑节次跳跃告警：只告警，绝不删除数据，防止丢课
+        suspect_warn = []
+        for entry in cleaned_data:
+            wk = entry["week"]
+            secs_sorted = sorted(entry["sections"])
+            for idx in range(1, len(secs_sorted)):
+                prev = secs_sorted[idx-1]
+                curr = secs_sorted[idx]
+                if curr - prev >= 4:
+                    suspect_warn.append(f"【{wk}】节次跳跃过大：{prev} → {curr}，请人工核对课表是否存在幻觉")
+
         debug_json_str = json.dumps(ai_course_data, ensure_ascii=False, indent=2)
         course_conflict, debug_calc_detail = calc_course_conflict(ai_course_data)
 
     except Exception as e:
-        return {"result": f"课表识别失败:{str(e)[:60]}", "debug_json": "", "debug_calc": []}
+        return {"result": f"课表识别失败:{str(e)[:60]}", "debug_json": "", "debug_calc": [], "suspect_warn":[]}
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
@@ -326,7 +321,12 @@ def fast_ai_extract(text:str, personal_need:str=""):
     else:
         final_conflict_str = "、".join(sorted(total))
 
-    return {"result": final_conflict_str, "debug_json": debug_json_str, "debug_calc": debug_calc_detail}
+    return {
+        "result": final_conflict_str,
+        "debug_json": debug_json_str,
+        "debug_calc": debug_calc_detail,
+        "suspect_warn": suspect_warn
+    }
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -556,7 +556,8 @@ if menu == "管理员后台":
                             "class_conflict": "",
                             "personal_need": "",
                             "debug_json": "",
-                            "debug_calc": []
+                            "debug_calc": [],
+                            "suspect_warn": []
                         })
                     st.session_state.temp_pdf_texts = texts
                     seen = set()
@@ -603,10 +604,12 @@ if menu == "管理员后台":
                                             current_rows[idx]["class_conflict"] = res_data["result"]
                                             current_rows[idx]["debug_json"] = res_data["debug_json"]
                                             current_rows[idx]["debug_calc"] = res_data["debug_calc"]
+                                            current_rows[idx]["suspect_warn"] = res_data["suspect_warn"]
                                         except Exception as e:
                                             current_rows[idx]["class_conflict"] = f"识别失败: {str(e)[:60]}"
                                             current_rows[idx]["debug_json"] = ""
                                             current_rows[idx]["debug_calc"] = []
+                                            current_rows[idx]["suspect_warn"] = []
                                         done += 1
                                         bar.progress(done/len(need_ai_texts))
                             for row in current_rows:
@@ -652,7 +655,10 @@ if menu == "管理员后台":
                     name = row["name"]
                     dj = row.get("debug_json","")
                     dc = row.get("debug_calc",[])
+                    sw = row.get("suspect_warn",[])
                     with st.expander(f"【{name}】点击展开DEBUG"):
+                        if sw and len(sw)>0:
+                            st.error("⚠️可疑幻觉告警："+"；".join(sw))
                         if dj:
                             st.markdown("**1. AI原始输出JSON**")
                             st.code(dj, language="json")
@@ -808,7 +814,7 @@ if menu == "管理员后台":
                         st.warning("账号和密码不能为空")
                     else:
                         admin_data["admins"].append({"username": new_admin_user, "password": new_admin_pwd, "is_super": False})
-                        save_admin(admin_data)
+                        save_members(admin_data)
                         st.success(f"管理员 {new_admin_user} 添加成功！")
                 st.divider()
                 st.markdown("#### 管理员列表")
@@ -824,7 +830,7 @@ if menu == "管理员后台":
                     if st.button("删除该管理员"):
                         admin_data = load_admin()
                         admin_data["admins"] = [a for a in admin_data["admins"] if a["username"] != delete_user]
-                        save_admin(admin_data)
+                        save_members(admin_data)
                         st.success(f"管理员 {delete_user} 已删除！")
                 else:
                     st.info("暂无普通管理员可删除")
