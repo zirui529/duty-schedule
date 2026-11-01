@@ -114,14 +114,13 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取【新版：Python解析完整表格，过滤空白单元格，保留星期‑节次‑课程对应关系，再组装文本交给AI】 ==========
+# ========== PDF读取：fitz优先解析表格，过滤空单元格，保留行列语义 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     output_parts = []
     for page in doc:
         tables = page.find_tables()
         if tables and len(tables.tables) > 0:
-            # 存在表格：解析表格，过滤空单元格，保留行列语义
             for tbl in tables.tables:
                 table_cells = tbl.extract()
                 for row in table_cells:
@@ -133,7 +132,6 @@ def get_pdf_full_text(pdf_bytes):
                     if row_parts:
                         output_parts.append(" | ".join(row_parts))
         else:
-            # 没有识别出表格，降级：取页面全部有效文字（非表格课表兜底）
             words = page.get_text("words")
             for w in words:
                 chunk = safe_str(w[4])
@@ -169,7 +167,7 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ========== AI底层调用 两套独立接口 ==========
+# ========== AI底层调用 ==========
 def _call_course_ai(prompt_text):
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -246,7 +244,7 @@ SECTION_TIME = {
     13:(20*60+10,20*60+55)
 }
 
-# ========== 完整区间重叠判断，修复跨班次课程漏判 ==========
+# ==========【新版业务冲突计算】课程完全在班次结束之后开课，则不判定冲突 ==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
     for item in ai_course_data:
@@ -256,10 +254,9 @@ def calc_course_conflict(ai_course_data):
             if s not in SECTION_TIME:
                 continue
             c_start, c_end = SECTION_TIME[s]
-            # 和上午、下午、晚上分别做区间重叠判断
             for shift_name, (sh_start, sh_end) in SHIFT_TIME_MIN.items():
-                # 区间重叠：not(课程结束<=班次开始 or 班次结束<=课程开始)
-                if not (c_end <= sh_start or sh_end <= c_start):
+                # 规则：课程全部在班次前结束 OR 课程全部在班次结束之后才开始 → 不冲突
+                if not (c_end <= sh_start or c_start >= sh_end):
                     conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
@@ -287,17 +284,24 @@ def fast_ai_extract(text:str, personal_need:str=""):
             if len(clean_sec)>0:
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
-        # DEBUG折叠面板，仅streamlit页面环境输出
+
+        # ---------------- 测试DEBUG：强制打印到Mac终端 ----------------
+        print("\n==========【AI原始课表JSON】==========")
+        print(json.dumps(ai_course_data, ensure_ascii=False, indent=2))
+        print("======================================\n")
+        # --------------------------------------------------------
+
+        # 网页折叠DEBUG面板
         if st.runtime.exists():
             with st.expander("🔍DEBUG AI读取原始课表(仅管理员批量上传可见)"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
+
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
-        # 不再把课表conflict传给AI，只传用户原始文字，杜绝AI参考课表脑补
         prompt_personal = f"""
 用户个人限制要求：{personal_need}
 """
