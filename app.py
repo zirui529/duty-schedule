@@ -75,6 +75,11 @@ def init_admin():
             data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
             json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
+def reset_default_admin():
+    """一键重置admin账号密码为 admin / 123456"""
+    data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
+    json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def load_admin():
     init_admin()
     return json.load(open(ADMIN_FILE, "r", encoding="utf-8"))
@@ -491,14 +496,21 @@ if menu == "管理员后台":
         st.title("管理员登录")
         admin_user = st.text_input("管理员账号")
         pwd_in = st.text_input("输入密码", type="password")
-        if st.button("确认登录"):
-            admin_info = verify_admin(admin_user, pwd_in)
-            if admin_info:
-                st.session_state.login = True
-                st.session_state.current_admin = admin_user
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("确认登录"):
+                admin_info = verify_admin(admin_user, pwd_in)
+                if admin_info:
+                    st.session_state.login = True
+                    st.session_state.current_admin = admin_user
+                    st.rerun()
+                else:
+                    st.error("账号或密码错误（默认账号：admin，密码：123456）")
+        with col2:
+            if st.button("🔧 一键重置为默认账号密码 admin / 123456"):
+                reset_default_admin()
+                st.success("✅ 重置完成！现在账号admin，密码123456，直接登录")
                 st.rerun()
-            else:
-                st.error("账号或密码错误（默认账号：admin，密码：123456）")
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
         st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro")
