@@ -114,12 +114,34 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取 ==========
+# ========== PDF读取【新版：Python解析完整表格，过滤空白单元格，保留星期‑节次‑课程对应关系，再组装文本交给AI】 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    txt = "".join(page.get_text() for page in doc)
+    output_parts = []
+    for page in doc:
+        tables = page.find_tables()
+        if tables and len(tables.tables) > 0:
+            # 存在表格：解析表格，过滤空单元格，保留行列语义
+            for tbl in tables.tables:
+                table_cells = tbl.extract()
+                for row in table_cells:
+                    row_parts = []
+                    for cell in row:
+                        c = safe_str(cell)
+                        if c:
+                            row_parts.append(c)
+                    if row_parts:
+                        output_parts.append(" | ".join(row_parts))
+        else:
+            # 没有识别出表格，降级：取页面全部有效文字（非表格课表兜底）
+            words = page.get_text("words")
+            for w in words:
+                chunk = safe_str(w[4])
+                if chunk:
+                    output_parts.append(chunk)
     doc.close()
-    return txt
+    final_text = "\n".join(output_parts)
+    return final_text
 
 def get_session():
     session = requests.Session()
@@ -160,7 +182,7 @@ def _call_course_ai(prompt_text):
 6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
 ⚠️极高优先级强制约束：
-1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。
+1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。文本没有出现，就当作没有课。
 2、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
 3、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
 4、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
@@ -224,7 +246,7 @@ SECTION_TIME = {
     13:(20*60+10,20*60+55)
 }
 
-# ========== 修改：完整区间重叠判断，修复跨班次课程漏判 ==========
+# ========== 完整区间重叠判断，修复跨班次课程漏判 ==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
     for item in ai_course_data:
@@ -275,7 +297,7 @@ def fast_ai_extract(text:str, personal_need:str=""):
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
-        # 【重要】不再把课表conflict传给AI，只传用户原始文字，杜绝AI参考课表脑补
+        # 不再把课表conflict传给AI，只传用户原始文字，杜绝AI参考课表脑补
         prompt_personal = f"""
 用户个人限制要求：{personal_need}
 """
