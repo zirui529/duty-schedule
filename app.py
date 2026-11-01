@@ -39,6 +39,7 @@ SHIFT_LIST = [
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":2,"shift_name": "17:00‑20:00", "need_stu": 2, "need_wei": 1}
 ]
+WEEK_NAMES_ORDER = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
 WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
@@ -49,6 +50,22 @@ SHIFT_TIME_MIN = {
     "上午": (9*60, 13*60),
     "下午": (13*60, 17*60),
     "晚上": (17*60, 20*60)
+}
+# 节次时间
+SECTION_TIME = {
+    1: (8*60+0, 8*60+45),
+    2: (8*60+50, 9*60+35),
+    3: (9*60+50,10*60+35),
+    4: (10*60+40,11*60+25),
+    5: (11*60+30,12*60+15),
+    6: (14*60+5, 14*60+50),
+    7: (14*60+55,15*60+40),
+    8: (15*60+45,16*60+30),
+    9: (16*60+40,17*60+25),
+    10:(17*60+30,18*60+15),
+    11:(18*60+30,19*60+15),
+    12:(19*60+20,20*60+5),
+    13:(20*60+10,20*60+55)
 }
 
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
@@ -114,80 +131,127 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取：读取全部文字，不做坐标切割，保证不漏课 ==========
-def get_pdf_full_text(pdf_bytes):
+# ==========【纯Python本地动态坐标解析课表，完全不调用大模型】 ==========
+def parse_timetable_local(pdf_bytes):
+    """
+    动态探测表头星期、节次坐标，本地解析课表
+    返回: timetable_list, warn_list
+    timetable_list: [{"week":"周三","sections":[1,2,3,4,11,12]}]
+    warn_list: 告警文本列表
+    """
+    warn_list = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    output_parts = []
-    for page in doc:
-        words = page.get_text("words")
-        for w in words:
-            chunk = safe_str(w[4])
-            if chunk:
-                output_parts.append(chunk)
+    page = doc[0]
+    words = page.get_text("words")
     doc.close()
-    return "\n".join(output_parts)
 
-def get_session():
-    session = requests.Session()
-    adapter = HTTPAdapter(max_retries=0)
-    session.mount("https://", adapter)
-    return session
+    week_header_pos = dict()
+    section_header_pos = dict()
+    rest_words = []
 
-def extract_name_from_text(text):
-    m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
-    return m.group(1).strip() if m else ""
-
-def parse_filename_phone_and_role(filename):
-    name_part = filename.split("-课表")[0]
-    parts = name_part.split("&")
-    role = "学员"
-    phone = ""
-    if len(parts) >= 3:
-        role_raw = parts[0]
-        if "职委" in role_raw:
-            role = "职委"
+    # 第一步：扫描表头文字块
+    for w in words:
+        x0,y0,x1,y1,txt = w[0],w[1],w[2],w[3],safe_str(w[4])
+        if txt in WEEK_NAMES_ORDER:
+            week_header_pos[txt] = x0
+        m = re.fullmatch(r"(\d{1,2})", txt)
+        if m:
+            snum = int(m.group(1))
+            if 1<=snum<=13:
+                section_header_pos[snum] = y0
         else:
-            role = "学员"
-        phone_candidate = parts[2].strip()
-        if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
-            phone = phone_candidate
-    return role, phone
+            rest_words.append((x0,y0,x1,y1,txt))
 
-# ========== AI底层调用 ==========
-def _call_course_ai(prompt_text):
-    headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": MODEL_ID,
-        "messages": [
-            {"role": "system", "content": """
-你是课表提取工具，**只输出JSON数组，绝对不能输出任何说明、注释、markdown、```符号**。
-下面是本系统全部节次标准时间，严格参照：
-1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
-6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
-10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
-⚠️极高优先级强制约束：
-1、**没有在当前星期标题下方明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止把其他星期的课程搬运过来！**
-2、不同星期课程互相独立！只把该星期标题下面出现的课分配给该星期。看到周一的课程，不能分配到周二/周三等其他星期。
-3、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
-4、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
-5、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
-6、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
-"""},
-            {"role": "user", "content": prompt_text}
-        ],
-        "temperature": 0
-    }
-    resp = requests.post(VOLC_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
-    res = resp.json()
-    out = res["choices"][0]["message"]["content"].strip()
-    out = re.sub(r"^```[^\n]*\n", "", out)
-    out = re.sub(r"\n```$", "", out)
-    match = re.search(r"\[.*\]", out, re.DOTALL)
-    if not match:
-        raise ValueError("模型没有返回合法JSON数组")
-    arr = json.loads(match.group(0))
-    return arr
+    # 校验表头完整性：区分周日缺失（正常）和其他星期缺失（严重）
+    missing_week = [w for w in WEEK_NAMES_ORDER if w not in week_header_pos]
+    for mw in missing_week:
+        if mw == "周日":
+            warn_list.append("提示：未探测到【周日】表头，该PDF导出不包含周日列，属于教务导出常见变体，可忽略。")
+        else:
+            warn_list.append(f"⚠️严重警告：未探测到星期表头：{mw}，解析结果极可能出错，请人工复核！")
 
+    missing_sec = [s for s in range(1,14) if s not in section_header_pos]
+    if missing_sec:
+        warn_list.append(f"⚠️警告：未探测到节次表头：{','.join(map(str,missing_sec))}，解析结果可能出错，请人工复核！")
+
+    # 构造星期X边界，按x坐标从小到大排序
+    sorted_week = sorted(week_header_pos.items(), key=lambda x:x[1])
+    week_bounds = []
+    for idx,(wname,x) in enumerate(sorted_week):
+        if idx < len(sorted_week)-1:
+            next_x = sorted_week[idx+1][1]
+            week_bounds.append((wname, x, next_x))
+        else:
+            week_bounds.append((wname, x, 9999))
+
+    # 构造节次Y边界，注意PDF y轴原点在页面左下角，y数值向上变小
+    sorted_sec = sorted(section_header_pos.items(), key=lambda x:x[1])
+    sec_bounds = []
+    for idx,(snum,y) in enumerate(sorted_sec):
+        if idx < len(sorted_sec)-1:
+            next_y = sorted_sec[idx+1][1]
+            sec_bounds.append((snum, next_y, y))
+        else:
+            sec_bounds.append((snum, -9999, y))
+
+    week_sec_map = {wn:set() for wn in WEEK_NAMES_ORDER}
+    # 兼容半角 "-" / 全角 "‑" 两种连堂符号
+    range_pat = re.compile(r"(\d{1,2})\s*[\-‑]\s*(\d{1,2})")
+
+    for (x0,y0,x1,y1,txt) in rest_words:
+        match_range = range_pat.search(txt)
+        nums_extract = []
+        if match_range:
+            a = int(match_range.group(1))
+            b = int(match_range.group(2))
+            if 1<=a<=13 and 1<=b<=13 and a<=b:
+                nums_extract = list(range(a,b+1))
+        else:
+            for num_str in re.findall(r"\b([1-9]|1[0-3])\b", txt):
+                ns = int(num_str)
+                if 1<=ns<=13:
+                    nums_extract.append(ns)
+        if not nums_extract:
+            continue
+        # 判断属于哪个星期列
+        hit_week = None
+        for wname, bx_left, bx_right in week_bounds:
+            if bx_left <= x0 < bx_right:
+                hit_week = wname
+                break
+        if hit_week is None:
+            warn_list.append(f"文字[{txt}]无法匹配到星期列，已丢弃")
+            continue
+        # 判断属于哪些节次行，取文字块垂直中心
+        y_mid = (y0+y1)/2
+        for snum, by_low, by_high in sec_bounds:
+            if by_low <= y_mid <= by_high:
+                week_sec_map[hit_week].update(nums_extract)
+
+    # 组装输出结构
+    timetable_list = []
+    for wn in WEEK_NAMES_ORDER:
+        sec_set = sorted(list(week_sec_map[wn]))
+        if len(sec_set)>0:
+            timetable_list.append({"week":wn,"sections":sec_set})
+    return timetable_list, warn_list
+
+def timetable_to_conflict(timetable_list):
+    """把本地解析出来的课表结构，转换成冲突时段字符串列表"""
+    conflict_set = set()
+    for item in timetable_list:
+        w = item["week"]
+        secs = item["sections"]
+        for s in secs:
+            if s not in SECTION_TIME:
+                continue
+            c_start,c_end = SECTION_TIME[s]
+            for shift_name,(sh_start,sh_end) in SHIFT_TIME_MIN.items():
+                if not (c_end <= sh_start or c_start >= sh_end):
+                    conflict_set.add(f"{w}{shift_name}")
+    return sorted(list(conflict_set))
+
+# ========== 个性化AI调用，仅非空才执行网络请求 ==========
 def _call_personal_ai(prompt_text):
     headers = {"Authorization": f"Bearer {VOLC_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -214,119 +278,40 @@ def _call_personal_ai(prompt_text):
     arr = json.loads(match.group(0))
     return [s.strip() for s in arr if isinstance(s, str)]
 
-# 【节次精确时间（分钟，从0点起算）】
-SECTION_TIME = {
-    1: (8*60+0, 8*60+45),
-    2: (8*60+50, 9*60+35),
-    3: (9*60+50,10*60+35),
-    4: (10*60+40,11*60+25),
-    5: (11*60+30,12*60+15),
-    6: (14*60+5, 14*60+50),
-    7: (14*60+55,15*60+40),
-    8: (15*60+45,16*60+30),
-    9: (16*60+40,17*60+25),
-    10:(17*60+30,18*60+15),
-    11:(18*60+30,19*60+15),
-    12:(19*60+20,20*60+5),
-    13:(20*60+10,20*60+55)
-}
-
-# ==========【新版业务冲突计算】课程完全在班次结束之后开课，则不判定冲突 ==========
-def calc_course_conflict(ai_course_data):
-    conflict = set()
-    debug_detail = []
-    for item in ai_course_data:
-        w = item["week"]
-        secs = item["sections"]
-        for s in secs:
-            if s not in SECTION_TIME:
-                continue
-            c_start, c_end = SECTION_TIME[s]
-            for shift_name, (sh_start, sh_end) in SHIFT_TIME_MIN.items():
-                # 规则：课程全部在班次前结束 OR 课程全部在班次结束之后才开始 → 不冲突
-                hit = not (c_end <= sh_start or c_start >= sh_end)
-                debug_detail.append({
-                    "week":w,
-                    "section":s,
-                    "c_start_min":c_start,
-                    "c_end_min":c_end,
-                    "shift":shift_name,
-                    "sh_start":sh_start,
-                    "sh_end":sh_end,
-                    "is_conflict": hit
-                })
-                if hit:
-                    conflict.add(f"{w}{shift_name}")
-    return sorted(list(conflict)), debug_detail
-
-
-def fast_ai_extract(text:str, personal_need:str=""):
-    debug_json_str = ""
-    debug_calc_detail = []
-    final_conflict_str = ""
-    suspect_warn = []
-    if not text or len(text.strip()) < 10:
-        return {"result": "课表文本提取失败，请手动填写", "debug_json": "", "debug_calc": [], "suspect_warn":[]}
-    prompt_course = f"""
-下面是课表原文，提取里面所有星期和节次：
-{text[:8000]}
-"""
-    try:
-        ai_course_data = _call_course_ai(prompt_course)
-        # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
-        valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
-        valid_sections = set(range(1,14))
-        cleaned_data = []
-        for entry in ai_course_data:
-            if not isinstance(entry,dict):
-                continue
-            w = entry.get("week","")
-            sec_list = entry.get("sections",[])
-            if w not in valid_weeks:
-                continue
-            clean_sec = [x for x in sec_list if isinstance(x,int) and x in valid_sections]
-            if len(clean_sec)>0:
-                cleaned_data.append({"week":w,"sections":clean_sec})
-        ai_course_data = cleaned_data
-
-        # 可疑节次跳跃告警：只告警，绝不删除数据，防止丢课
-        suspect_warn = []
-        for entry in cleaned_data:
-            wk = entry["week"]
-            secs_sorted = sorted(entry["sections"])
-            for idx in range(1, len(secs_sorted)):
-                prev = secs_sorted[idx-1]
-                curr = secs_sorted[idx]
-                if curr - prev >= 4:
-                    suspect_warn.append(f"【{wk}】节次跳跃过大：{prev} → {curr}，请人工核对课表是否存在幻觉")
-
-        debug_json_str = json.dumps(ai_course_data, ensure_ascii=False, indent=2)
-        course_conflict, debug_calc_detail = calc_course_conflict(ai_course_data)
-
-    except Exception as e:
-        return {"result": f"课表识别失败:{str(e)[:60]}", "debug_json": "", "debug_calc": [], "suspect_warn":[]}
-
+def merge_personal_conflict(base_conflict_str:str, personal_need:str):
     personal_conflict = []
-    if personal_need and personal_need.strip() not in ("","无"):
-        prompt_personal = f"""
-用户个人限制要求：{personal_need}
-"""
+    need_ai = bool(personal_need and personal_need.strip() not in ("","无"))
+    if need_ai:
         try:
-            personal_conflict = _call_personal_ai(prompt_personal)
+            personal_conflict = _call_personal_ai(personal_need)
         except Exception:
             personal_conflict = []
-    total = list(set(course_conflict + personal_conflict))
-    if not total:
-        final_conflict_str = "识别为空，请手动填写"
-    else:
-        final_conflict_str = "、".join(sorted(total))
+    base_list = re.split(r"、", safe_str(base_conflict_str))
+    base_list = [x.strip() for x in base_list if x.strip()]
+    total_set = set(base_list)
+    total_set.update(personal_conflict)
+    final_str = "、".join(sorted(total_set)) if total_set else ""
+    return final_str, personal_conflict
 
-    return {
-        "result": final_conflict_str,
-        "debug_json": debug_json_str,
-        "debug_calc": debug_calc_detail,
-        "suspect_warn": suspect_warn
-    }
+def extract_name_from_text(text):
+    m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
+    return m.group(1).strip() if m else ""
+
+def parse_filename_phone_and_role(filename):
+    name_part = filename.split("-课表")[0]
+    parts = name_part.split("&")
+    role = "学员"
+    phone = ""
+    if len(parts) >= 3:
+        role_raw = parts[0]
+        if "职委" in role_raw:
+            role = "职委"
+        else:
+            role = "学员"
+        phone_candidate = parts[2].strip()
+        if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
+            phone = phone_candidate
+    return role, phone
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -504,8 +489,12 @@ if "user_template_bytes" not in st.session_state:
     st.session_state.user_template_bytes = None
 if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
-if "temp_pdf_texts" not in st.session_state:
-    st.session_state.temp_pdf_texts = []
+if "temp_raw_text" not in st.session_state:
+    st.session_state.temp_raw_text = []
+if "temp_timetable" not in st.session_state:
+    st.session_state.temp_timetable = []
+if "temp_warns" not in st.session_state:
+    st.session_state.temp_warns = []
 
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
@@ -535,138 +524,110 @@ if menu == "管理员后台":
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接"])
             tab6 = None
         with tab1:
-            st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号-课表.pdf）")
-            up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
-            if up_files and st.button("📂 第一步：快速识别姓名、身份、电话，生成预览表格"):
-                with st.spinner("正在本地读取PDF和文件名..."):
-                    texts = []
-                    new_members = []
-                    for f in up_files:
-                        b = f.read()
-                        t = get_pdf_full_text(b)
-                        texts.append(t)
-                        name = extract_name_from_text(t)
-                        role_from_file, phone_from_file = parse_filename_phone_and_role(f.name)
-                        if not name:
-                            continue
-                        new_members.append({
-                            "name": name,
-                            "phone": phone_from_file,
-                            "role": role_from_file,
-                            "class_conflict": "",
-                            "personal_need": "",
-                            "debug_json": "",
-                            "debug_calc": [],
-                            "suspect_warn": []
-                        })
-                    st.session_state.temp_pdf_texts = texts
-                    seen = set()
-                    unique = []
-                    for item in new_members:
-                        if item["name"] not in seen:
-                            seen.add(item["name"])
-                            unique.append(item)
-                    st.session_state.temp_new_member = unique
-                st.success(f"本地识别完成，共 {len(unique)} 人！先在表格里填好个性化需求，再点第二步让AI综合识别。")
+            st.subheader("批量上传PDF课表【本地Python预解析课表；**仅个性化不为空才调用AI**；预填结果务必人工复核】")
+            up_files = st.file_uploader("选择课表PDF，多个可批量", type="pdf", accept_multiple_files=True)
+            if up_files and st.button("📂第一步：本地解析PDF，生成预填表格（无大模型调用）"):
+                temp_members = []
+                temp_raw = []
+                temp_tt = []
+                temp_wn = []
+                for f in up_files:
+                    pdf_bytes = f.read()
+                    tt_list, warn_list = parse_timetable_local(pdf_bytes)
+                    conflict_pre_list = timetable_to_conflict(tt_list)
+                    conflict_pre_str = "、".join(conflict_pre_list)
+                    doc_tmp = fitz.open(stream=pdf_bytes,filetype="pdf")
+                    raw_text = doc_tmp.get_page_text(0)
+                    doc_tmp.close()
+                    name = extract_name_from_text(raw_text)
+                    role, phone = parse_filename_phone_and_role(f.name)
+                    temp_members.append({
+                        "name":name,
+                        "phone":phone,
+                        "role":role,
+                        "class_conflict": conflict_pre_str,
+                        "personal_need": "",
+                        "local_timetable": tt_list,
+                        "local_warn": warn_list
+                    })
+                    temp_raw.append(raw_text)
+                    temp_tt.append(tt_list)
+                    temp_wn.append(warn_list)
+                st.session_state.temp_new_member = temp_members
+                st.session_state.temp_raw_text = temp_raw
+                st.session_state.temp_timetable = temp_tt
+                st.session_state.temp_warns = temp_wn
+                st.success("✅本地解析完成！⚠️预填仅做参考，务必人工核对修改class_conflict再保存！")
                 st.rerun()
             if len(st.session_state.temp_new_member) > 0:
                 st.divider()
-                st.subheader("📋 预览表格（先填个性化需求，再点AI识别，AI会综合课表+需求一起算）")
+                st.warning("⚠️【重要】课表冲突是Python本地预填结果，**必须人工复核修改，确认无误再入库！课表解析不调用AI；只有个性化不为空才会调用AI接口**")
                 df_temp = pd.DataFrame(st.session_state.temp_new_member)
                 temp_config = {
                     "role": st.column_config.SelectboxColumn("身份", options=["学员","职委"], required=True),
-                    "class_conflict": st.column_config.TextColumn("AI识别不能值班时段（课表+需求综合）"),
-                    "personal_need": st.column_config.TextColumn("个性化需求（手动填，AI会自动识别各种说法）")
+                    "class_conflict": st.column_config.TextColumn("不能值班时段【人工复核修改】"),
+                    "personal_need": st.column_config.TextColumn("个性化限制（非空才调用AI合并）")
                 }
-                edited_temp = st.data_editor(df_temp, use_container_width=True, column_config=temp_config, num_rows="dynamic", key="temp_editor")
+                edited_temp = st.data_editor(df_temp, use_container_width=True, column_config=temp_config, num_rows="dynamic", key="temp_edit")
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
-                    if st.button("🤖 第二步：AI综合识别（课表+个性化需求）"):
-                        current_rows = edited_temp.to_dict("records")
-                        need_ai_idx = []
-                        need_ai_texts = []
-                        need_ai_personal = []
-                        for i, row in enumerate(current_rows):
-                            if not safe_str(row.get("class_conflict")):
-                                need_ai_idx.append(i)
-                                need_ai_texts.append(st.session_state.temp_pdf_texts[i] if i < len(st.session_state.temp_pdf_texts) else "")
-                                need_ai_personal.append(safe_str(row.get("personal_need")))
-                        if need_ai_texts:
-                            with st.spinner(f"AI正在综合分析 {len(need_ai_texts)} 人的课表和个性化需求..."):
-                                bar = st.progress(0)
-                                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                                    futures = {executor.submit(fast_ai_extract, t, p): idx for idx, t, p in zip(need_ai_idx, need_ai_texts, need_ai_personal)}
-                                    done = 0
-                                    for fut in as_completed(futures):
-                                        idx = futures[fut]
-                                        try:
-                                            res_data = fut.result()
-                                            current_rows[idx]["class_conflict"] = res_data["result"]
-                                            current_rows[idx]["debug_json"] = res_data["debug_json"]
-                                            current_rows[idx]["debug_calc"] = res_data["debug_calc"]
-                                            current_rows[idx]["suspect_warn"] = res_data["suspect_warn"]
-                                        except Exception as e:
-                                            current_rows[idx]["class_conflict"] = f"识别失败: {str(e)[:60]}"
-                                            current_rows[idx]["debug_json"] = ""
-                                            current_rows[idx]["debug_calc"] = []
-                                            current_rows[idx]["suspect_warn"] = []
-                                        done += 1
-                                        bar.progress(done/len(need_ai_texts))
-                            for row in current_rows:
-                                row["personal_need"] = safe_str(row.get("personal_need"))
-                                row["class_conflict"] = safe_str(row.get("class_conflict"))
-                                row["name"] = safe_str(row.get("name"))
-                                row["phone"] = safe_str(row.get("phone"))
-                                row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
-                            st.session_state.temp_new_member = current_rows
-                            st.success("AI综合识别完成！课表冲突和个性化需求已合并计算。")
-                            st.rerun()
-                        else:
-                            st.info("所有人都已识别，不需要AI！")
+                    if st.button("🤖第二步：合并个性化限制（仅personal_need非空会调用AI）"):
+                        rows = edited_temp.to_dict("records")
+                        for idx,row in enumerate(rows):
+                            base = safe_str(row["class_conflict"])
+                            pn = safe_str(row["personal_need"])
+                            final_str, p_conf = merge_personal_conflict(base, pn)
+                            rows[idx]["class_conflict"] = final_str
+                        st.session_state.temp_new_member = rows
+                        st.success("个性化合并完成，请再次复核结果")
+                        st.rerun()
                 with col_b:
-                    if st.button("✅ 确认保存入库"):
+                    if st.button("✅确认保存入库"):
                         all_mem = load_members()
                         exist_names = {x["name"] for x in all_mem}
-                        add_list = edited_temp.to_dict("records")
-                        new_add = []
-                        for row in add_list:
-                            nm = safe_str(row.get("name"))
+                        add_rows = edited_temp.to_dict("records")
+                        added = 0
+                        for r in add_rows:
+                            nm = safe_str(r["name"])
                             if nm and nm not in exist_names:
-                                row["personal_need"] = safe_str(row.get("personal_need"))
-                                row["class_conflict"] = safe_str(row.get("class_conflict"))
-                                row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
-                                new_add.append(row)
-                        all_mem.extend(new_add)
+                                new_item = {
+                                    "name":nm,
+                                    "phone":safe_str(r["phone"]),
+                                    "role":safe_str(r["role"]) if safe_str(r["role"]) else "学员",
+                                    "class_conflict":safe_str(r["class_conflict"]),
+                                    "personal_need":safe_str(r["personal_need"])
+                                }
+                                all_mem.append(new_item)
+                                added +=1
                         save_members(all_mem)
-                        st.success(f"成功录入 {len(new_add)} 人！")
+                        st.success(f"成功入库{added}条记录")
                         st.session_state.temp_new_member = []
-                        st.session_state.temp_pdf_texts = []
+                        st.session_state.temp_raw_text = []
+                        st.session_state.temp_timetable = []
+                        st.session_state.temp_warns = []
                         st.rerun()
                 with col_c:
-                    if st.button("❌ 放弃本批"):
+                    if st.button("❌放弃本批"):
                         st.session_state.temp_new_member = []
-                        st.session_state.temp_pdf_texts = []
+                        st.session_state.temp_raw_text = []
+                        st.session_state.temp_timetable = []
+                        st.session_state.temp_warns = []
                         st.rerun()
 
-                # ========== 逐行展开调试面板 ==========
+                # 逐条展示解析告警
                 st.divider()
-                st.subheader("🔍 单行调试面板（展开查看对应人员的识别日志）")
-                for idx, row in enumerate(st.session_state.temp_new_member):
+                st.subheader("🔍各文件解析告警信息")
+                for idx,row in enumerate(st.session_state.temp_new_member):
                     name = row["name"]
-                    dj = row.get("debug_json","")
-                    dc = row.get("debug_calc",[])
-                    sw = row.get("suspect_warn",[])
-                    with st.expander(f"【{name}】点击展开DEBUG"):
-                        if sw and len(sw)>0:
-                            st.error("⚠️可疑幻觉告警："+"；".join(sw))
-                        if dj:
-                            st.markdown("**1. AI原始输出JSON**")
-                            st.code(dj, language="json")
-                        if dc:
-                            st.markdown("**2. 逐条课程-班次冲突运算表**")
-                            st.dataframe(dc)
-                        st.markdown("**3. 最终冲突字符串**")
-                        st.text(row["class_conflict"])
+                    warns = row.get("local_warn",[])
+                    with st.expander(f"【{name}】解析告警"):
+                        if len(warns) ==0:
+                            st.success("无解析告警")
+                        else:
+                            for wtxt in warns:
+                                st.info(wtxt)
+                        st.markdown("本地解析识别课表结构：")
+                        st.code(json.dumps(row.get("local_timetable",[]),ensure_ascii=False,indent=2),language="json")
 
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
@@ -699,10 +660,10 @@ if menu == "管理员后台":
                     st.warning("人员库已清空！")
                     st.rerun()
         with tab3:
-            st.subheader("一键排班（AI综合考虑课表冲突+个性化需求+职委均匀轮班）")
+            st.subheader("一键排班（课表冲突+个性化限制+职委均匀轮班）")
             mlist = load_members()
             if st.button("生成值班表"):
-                with st.spinner("正在智能排班，综合考虑课表冲突和个性化需求..."):
+                with st.spinner("正在智能排班..."):
                     result = smart_schedule(mlist)
                     st.session_state.schedule_result = result
                 st.success("排班完成！")
@@ -721,7 +682,7 @@ if menu == "管理员后台":
                             pdf_buf = export_pdf_auto(st.session_state.schedule_result, pdf_template_sel)
                         st.download_button("下载值班表", pdf_buf, file_name="值班表.pdf", mime="application/pdf")
             else:
-                st.info("上传你自己的空白值班表PDF模板，文字块整体缩小居中")
+                st.info("上传你自己的空白值班表PDF模板")
                 user_up = st.file_uploader("上传你的空白值班表PDF模板", type="pdf")
                 if user_up:
                     st.session_state.user_template_bytes = user_up.read()
@@ -739,17 +700,15 @@ if menu == "管理员后台":
                         st.download_button("下载填充好的值班表", out_buf, file_name="值班表_已填充.pdf", mime="application/pdf")
         with tab5:
             st.subheader("分享自助提交链接")
-            st.info("把下面这个链接发给成员，他们可以免登录自助上传课表、填写个性化需求")
+            st.info("成员自助页面上传PDF**不会自动解析课表，需要管理员后台补录冲突时段**")
             try:
                 base_app_url = str(st.context.url)
             except Exception:
                 base_app_url = "http://localhost:8501"
             base_app_url = base_app_url.rstrip("/")
             self_link = f"{base_app_url}?page=self"
-            st.text_input("自动识别得到网址（请勿修改）", value=base_app_url, disabled=True)
+            st.text_input("访问链接", value=base_app_url, disabled=True)
             st.code(self_link, language="text")
-            if st.button("复制链接提示"):
-                st.success("链接已生成，直接复制发给成员即可！")
         if tab6 is not None:
             with tab6:
                 st.subheader("管理员管理（仅超级管理员可见）")
@@ -796,7 +755,7 @@ if menu == "管理员后台":
                         for a in admin_data["admins"]:
                             if a["username"] == st.session_state.current_admin and a["password"] == old_pwd2:
                                 a["password"] = new_pwd2
-                                save_admin(admin_data)
+                                save_members(admin_data)
                                 st.success("密码修改成功！")
                                 break
                         else:
@@ -814,7 +773,7 @@ if menu == "管理员后台":
                         st.warning("账号和密码不能为空")
                     else:
                         admin_data["admins"].append({"username": new_admin_user, "password": new_admin_pwd, "is_super": False})
-                        save_members(admin_data)
+                        save_admin(admin_data)
                         st.success(f"管理员 {new_admin_user} 添加成功！")
                 st.divider()
                 st.markdown("#### 管理员列表")
@@ -828,9 +787,8 @@ if menu == "管理员后台":
                 if normal_admins:
                     delete_user = st.selectbox("选择要删除的管理员", normal_admins)
                     if st.button("删除该管理员"):
-                        admin_data = load_admin()
                         admin_data["admins"] = [a for a in admin_data["admins"] if a["username"] != delete_user]
-                        save_members(admin_data)
+                        save_admin(admin_data)
                         st.success(f"管理员 {delete_user} 已删除！")
                 else:
                     st.info("暂无普通管理员可删除")
@@ -840,32 +798,33 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
+    st.info("⚠️自助上传仅保存姓名、手机号、身份、个性化需求；**课表冲突需要管理员后台人工补录**，不会自动解析PDF课表。")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
         role_sel = st.radio("身份", ["学员","职委"])
-        limit_input = st.text_input("个性化需求（选填，各种说法都行：周末不值班 / 只在周六下午有空 / 周一上午有课）")
-        pdf_file = st.file_uploader("上传你的课表PDF", type="pdf")
+        limit_input = st.text_input("个性化需求（选填，无则留空）")
+        pdf_file = st.file_uploader("上传你的课表PDF（仅用于存档，不自动解析）", type="pdf")
         submit = st.form_submit_button("提交")
         if submit:
-            if not (name and phone and pdf_file):
-                st.warning("姓名、电话、课表都需要填！")
+            if not (name and phone):
+                st.warning("姓名、联系电话为必填项")
             else:
-                with st.spinner("AI正在综合分析你的课表和个性化需求..."):
-                    txt = get_pdf_full_text(pdf_file.read())
-                    ret = fast_ai_extract(txt, limit_input)
-                    class_conflict = ret["result"]
-                    personal_need = safe_str(limit_input)
-                    all_mem = load_members()
-                    exist = False
-                    for m in all_mem:
-                        if m["name"] == name:
-                            m["phone"] = phone
-                            m["role"] = role_sel
-                            m["class_conflict"] = class_conflict
-                            m["personal_need"] = personal_need
-                            exist = True
-                    if not exist:
-                        all_mem.append({"name":name,"phone":phone,"role":role_sel,"class_conflict":class_conflict,"personal_need":personal_need})
-                    save_members(all_mem)
-                st.success("提交成功！AI已综合识别你所有不能值班的时段。")
+                all_mem = load_members()
+                exist = False
+                for m in all_mem:
+                    if m["name"] == name:
+                        m["phone"] = phone
+                        m["role"] = role_sel
+                        m["personal_need"] = safe_str(limit_input)
+                        exist = True
+                if not exist:
+                    all_mem.append({
+                        "name":name,
+                        "phone":phone,
+                        "role":role_sel,
+                        "class_conflict":"",
+                        "personal_need":safe_str(limit_input)
+                    })
+                save_members(all_mem)
+                st.success("提交成功！请联系管理员补录你的课表冲突时段。")
