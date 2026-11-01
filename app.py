@@ -177,10 +177,12 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# ========= 课表提取：固定调用 DashScope qwen3.5‑ocr =========
+# ========= 课表提取：固定调用 DashScope qwen3.5‑ocr 【修复404地址】 =========
 def _call_course_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
+    # 修复：补全 /chat/completions
+    url = DS_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
         "model": DS_MODEL_OCR,
         "messages": [
@@ -189,7 +191,7 @@ def _call_course_ai(prompt_text:str):
         ],
         "temperature":0
     }
-    resp = sess.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
@@ -203,6 +205,7 @@ def _call_course_ai(prompt_text:str):
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
+    url = ARK_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
         "model": ARK_MODEL,
         "messages": [
@@ -211,7 +214,7 @@ def _call_personal_ai(prompt_text:str):
         ],
         "temperature":0
     }
-    resp = sess.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
