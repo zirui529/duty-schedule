@@ -39,7 +39,7 @@ SHIFT_LIST = [
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":2,"shift_name": "17:00‑20:00", "need_stu": 2, "need_wei": 1}
 ]
-WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+WEEK_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
 ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
@@ -114,32 +114,35 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取：fitz优先解析表格，过滤空单元格，保留行列语义 ==========
+# ==========【新版：基于页面坐标解析课表，不再使用find_tables，规避合并单元格漂移】 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    output_parts = []
-    for page in doc:
-        tables = page.find_tables()
-        if tables and len(tables.tables) > 0:
-            for tbl in tables.tables:
-                table_cells = tbl.extract()
-                for row in table_cells:
-                    row_parts = []
-                    for cell in row:
-                        c = safe_str(cell)
-                        if c:
-                            row_parts.append(c)
-                    if row_parts:
-                        output_parts.append(" | ".join(row_parts))
-        else:
-            words = page.get_text("words")
-            for w in words:
-                chunk = safe_str(w[4])
-                if chunk:
-                    output_parts.append(chunk)
+    page = doc[0]
+    page_w = page.rect.width
+    page_h = page.rect.height
+    words = page.get_text("words")
+    # 7列星期横向划分：周日｜周一｜周二｜周三｜周四｜周五｜周六
+    col_width = page_w / 7.0
+    week_buckets = {w: [] for w in WEEK_NAMES}
+
+    for w_item in words:
+        x0, y0, x1, y1, txt = w_item[0], w_item[1], w_item[2], w_item[3], w_item[4]
+        txt = safe_str(txt)
+        if not txt:
+            continue
+        col_idx = int(x0 / col_width)
+        if 0 <= col_idx < 7:
+            week_name = WEEK_NAMES[col_idx]
+            week_buckets[week_name].append((-y0, txt))
+
+    output_lines = []
+    for w_name in WEEK_NAMES:
+        items = week_buckets[w_name]
+        items.sort()
+        chunk_text = " ".join([i[1] for i in items])
+        output_lines.append(f"【{w_name}】:{chunk_text}")
     doc.close()
-    final_text = "\n".join(output_parts)
-    return final_text
+    return "\n".join(output_lines)
 
 def get_session():
     session = requests.Session()
@@ -180,11 +183,12 @@ def _call_course_ai(prompt_text):
 6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
 ⚠️极高优先级强制约束：
-1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。文本没有出现，就当作没有课。
-2、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
-3、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
-4、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
-5、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
+1、**没有在【XX】标记块下面文本明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。文本没有出现，就当作没有课。
+2、⚠️极其重要：各个星期完全互相独立！【周日】块的课程只属于周日，【周一】只属于周一，**严禁把A星期块内看到的节次挪到B星期！**
+3、星期只能是：周日、周一、周二、周三、周四、周五、周六；节次只能1‑13的整数，其他数字一律丢弃。
+4、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
+5、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
+6、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
 """},
             {"role": "user", "content": prompt_text}
         ],
@@ -280,13 +284,13 @@ def fast_ai_extract(text:str, personal_need:str=""):
     if not text or len(text.strip()) < 10:
         return {"result": "课表文本提取失败，请手动填写", "debug_json": "", "debug_calc": []}
     prompt_course = f"""
-下面是课表原文，提取里面所有星期和节次：
+下面是课表原文，每个星期内容被【星期名称】标记隔离：
 {text[:8000]}
 """
     try:
         ai_course_data = _call_course_ai(prompt_course)
         # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
-        valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
+        valid_weeks = {"周日","周一","周二","周三","周四","周五","周六"}
         valid_sections = set(range(1,14))
         cleaned_data = []
         for entry in ai_course_data:
