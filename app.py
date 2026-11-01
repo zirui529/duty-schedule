@@ -7,7 +7,6 @@ import re
 import random
 from io import BytesIO
 import requests
-import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -147,7 +146,7 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== 双模型调用层 ======================
+# ====================== 双模型调用层【修复连接池：独立session，限制连接，3次重试】 ======================
 EXTRACT_SYS_PROMPT = """
 你是课表提取工具，**只输出JSON数组，绝对不能输出任何说明、注释、markdown、```符号**。
 下面是本系统全部节次标准时间：
@@ -168,8 +167,15 @@ PERSONAL_SYS_PROMPT = """
 禁止markdown、禁止解释文字。
 """
 
+def _make_http_session():
+    sess = requests.Session()
+    adapt = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1), pool_connections=1, pool_maxsize=1)
+    sess.mount("https://", adapt)
+    return sess
+
 def call_ark_course(text:str):
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content‑Type": "application/json"}
+    sess = _make_http_session()
+    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": ARK_MODEL,
         "messages": [
@@ -178,7 +184,7 @@ def call_ark_course(text:str):
         ],
         "temperature":0
     }
-    resp = requests.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
@@ -189,7 +195,8 @@ def call_ark_course(text:str):
     return json.loads(match.group(0))
 
 def call_dashscope_course(text:str):
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content‑Type": "application/json"}
+    sess = _make_http_session()
+    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": DS_MODEL,
         "messages": [
@@ -198,7 +205,7 @@ def call_dashscope_course(text:str):
         ],
         "temperature":0
     }
-    resp = requests.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
@@ -209,7 +216,8 @@ def call_dashscope_course(text:str):
     return json.loads(match.group(0))
 
 def call_ark_personal(text:str):
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content‑Type": "application/json"}
+    sess = _make_http_session()
+    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": ARK_MODEL,
         "messages": [
@@ -218,7 +226,7 @@ def call_ark_personal(text:str):
         ],
         "temperature":0
     }
-    resp = requests.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
@@ -230,7 +238,8 @@ def call_ark_personal(text:str):
     return [s.strip() for s in arr if isinstance(s,str)]
 
 def call_dashscope_personal(text:str):
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content‑Type": "application/json"}
+    sess = _make_http_session()
+    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": DS_MODEL,
         "messages": [
@@ -239,7 +248,7 @@ def call_dashscope_personal(text:str):
         ],
         "temperature":0
     }
-    resp = requests.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
+    resp = sess.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
