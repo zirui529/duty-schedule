@@ -34,6 +34,7 @@ try:
     MODEL_ID = st.secrets["ARK_MODEL_ENDPOINT_ID"]
 except KeyError:
     st.warning("⚠️ 缺少火山方舟密钥，请在 Streamlit Secrets 中配置 ARK_API_KEY、ARK_ENDPOINT、ARK_MODEL_ENDPOINT_ID。AI 识别功能将不可用。")
+    # 不再使用 st.stop()，而是让 AI 相关的函数自行检查 VOLC_API_KEY 是否为 None
 
 API_TIMEOUT = 30
 MAX_WORKERS = 4
@@ -150,6 +151,7 @@ def parse_filename_phone_and_role(filename):
     phone = ""
     if len(parts) >= 3:
         role_raw = parts[0]
+        # 允许更灵活的身份识别
         if "职委" in role_raw or "干部" in role_raw or "部长" in role_raw or "主席" in role_raw:
             role = "职委"
         else:
@@ -554,11 +556,6 @@ def _get_query_param_value(params_dict, key, default=""):
 _is_self_page = (_get_query_param_value(_query_params, "page") == "self")
 
 
-if _is_self_page:
-    menu = "成员自助上传"
-else:
-    menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
-
 # 初始化 session_state，确保所有键都存在
 for key, val in [("login", False), ("current_admin", ""), ("schedule_result", None),
                  ("user_template_bytes", None), ("temp_new_member", []),
@@ -567,6 +564,12 @@ for key, val in [("login", False), ("current_admin", ""), ("schedule_result", No
         st.session_state[key] = val
 
 # ========== 主流程 ==========
+if _is_self_page:
+    menu = "成员自助上传"
+else:
+    menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
+
+
 if menu == "管理员后台":
     if not st.session_state.login:
         st.title("管理员登录")
