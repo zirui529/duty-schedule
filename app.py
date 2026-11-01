@@ -156,6 +156,7 @@ def parse_filename_phone_and_role(filename):
             role = "学员"
         phone_candidate = parts[2].strip()
         try:
+            # 重新字面检查 regex 模式
             if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
                 phone = phone_candidate
         except re.error: # 如果正则表达式本身有问题，捕获并忽略
@@ -220,9 +221,10 @@ def _call_course_ai(prompt_text):
         raise ValueError(f"API 返回非 JSON 格式数据，状态码 {resp.status_code}: {resp.text[:120]}")
 
     out = response_data["choices"][0]["message"]["content"].strip()
-    out = re.sub(r"^```[^\n]*\n", "", out)
-    out = re.sub(r"\n```$", "", out)
-    match = re.search(r"\\[.*\\\]", out, re.DOTALL)
+    # 重新字面检查 regex 模式，确保无隐形字符
+    out = re.sub(r"^```[^\n]*\n", "", out) 
+    out = re.sub(r"\n```$", "", out)       
+    match = re.search(r"\\[.*\\\]", out, re.DOTALL) 
     if not match:
         raise ValueError("模型返回数据不包含合法的 JSON 数组")
     return json.loads(match.group(0))
@@ -253,6 +255,7 @@ def _call_personal_ai(prompt_text):
         return [] # 如果返回非 JSON，也返回空列表
 
     out = response_data["choices"][0]["message"]["content"].strip()
+    # 重新字面检查 regex 模式，确保无隐形字符
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\\[.*\\\]", out, re.DOTALL)
@@ -309,8 +312,13 @@ def fast_ai_extract(text, personal_need=""):
 课表原文：
 {text[:8000]}
 """
+    # 局部变量用于捕获 _call_course_ai 内部可能的原始输出
+    _ai_raw_out = "" 
     try:
         ai_course_data = _call_course_ai(prompt_course)
+        # 如果 _call_course_ai 成功，其内部的原始输出在这里已经处理过，
+        # 所以_ai_raw_out只有在_call_course_ai内部出错时才有意义
+        
         valid_weeks = set(WEEK_NAMES)
         cleaned = {}
         for entry in ai_course_data:
@@ -331,6 +339,10 @@ def fast_ai_extract(text, personal_need=""):
                 
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
+        # 如果捕获到异常，检查是否有原始模型输出，并打印到控制台或日志
+        st.error(f"DEBUG: 课表识别内部错误，异常信息: {e}. ")
+        # if _ai_raw_out:
+        #     st.error(f"DEBUG: 导致错误的原始模型输出（可能在_call_course_ai内部）: {_ai_raw_out}")
         return f"课表识别失败:{str(e)[:60]}"
 
     personal_conflict = []
@@ -472,7 +484,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x=0, offset_y=-
                 
     # 动态计算每个单元格的文本块高度，并设置顶部的填充
     # 假设最少一个学员，一个职委。最多2学员1职委。
-    max_block_height = (font_title + gap_title) * 2 + (font_name + gap_name + font_phone + gap_phone) * 2 + (font_name + gap_name + font_phone + gap_phone) # 2学员 + 1职委的文本空间
+    # 这里需要更精确的计算，因为高度可能随着内容变化
     
     for si in range(3):
         for wi in range(7):
@@ -482,47 +494,49 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x=0, offset_y=-
             
             pos_x = start_x + wi * cell_w + 5
             
-            # 尝试居中对齐文字块
-            current_y_offset = 0 # 当前单元格内的 Y 偏移
-            
-            # 粗略计算当前单元格内文字块的实际高度
-            actual_block_height = (font_title + gap_title) # "值班学员"
-            for _ in stu_list:
-                actual_block_height += (font_name + gap_name) # 姓名
-                # if phone: 
-                actual_block_height += (font_phone + gap_phone) # 电话 (即使没有也预留空间)
-            actual_block_height += (font_title + gap_title) # "轮值职委"
-            for _ in wei_list:
-                actual_block_height += (font_name + gap_name) # 姓名
-                # if phone: 
-                actual_block_height += (font_phone + gap_phone) # 电话 (即使没有也预留空间)
+            # 计算当前单元格内文字块的实际高度，用于垂直居中
+            actual_block_height = 0
+            if stu_list:
+                actual_block_height += (font_title + gap_title) # "值班学员"
+                for _, phone in stu_list:
+                    actual_block_height += (font_name + gap_name) # 姓名
+                    if phone: actual_block_height += (font_phone + gap_phone) # 电话
+                    else: actual_block_height += gap_name # 无电话也预留一点
+            if wei_list:
+                actual_block_height += (font_title + gap_title) # "轮值职委"
+                for _, phone in wei_list:
+                    actual_block_height += (font_name + gap_name) # 姓名
+                    if phone: actual_block_height += (font_phone + gap_phone) # 电话
+                    else: actual_block_height += gap_name # 无电话也预留一点
             
             top_pad = (cell_h - actual_block_height) / 2 # 计算顶部填充，实现垂直居中
             if top_pad < 0: top_pad = 5 # 避免文字溢出到单元格上方
 
             cy = start_y + si * cell_h + top_pad # 计算该单元格的起始Y坐标
             
-            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
-            cy += gap_title
-            for name, phone in stu_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
-                cy += gap_name
-                if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
-                    cy += gap_phone
-                else:
-                    cy += gap_name # 即使没有电话也预留间距
+            if stu_list:
+                page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
+                cy += gap_title
+                for name, phone in stu_list:
+                    page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
+                    cy += gap_name
+                    if phone:
+                        page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                        cy += gap_phone
+                    else:
+                        cy += gap_name # 即使没有电话也预留间距
             
-            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
-            cy += gap_title
-            for name, phone in wei_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
-                cy += gap_name
-                if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
-                    cy += gap_phone
-                else:
-                    cy += gap_name # 即使没有电话也预留间距
+            if wei_list:
+                page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
+                cy += gap_title
+                for name, phone in wei_list:
+                    page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
+                    cy += gap_name
+                    if phone:
+                        page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                        cy += gap_phone
+                    else:
+                        cy += gap_name # 即使没有电话也预留间距
     
     out_buf = BytesIO()
     doc.save(out_buf)
@@ -532,17 +546,20 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x=0, offset_y=-
 
 
 # ========== 获取页面参数（兼容旧版 Streamlit） ==========
+# Streamlit 1.10.0 之前 st.query_params 不存在，使用 st.experimental_get_query_params
 try:
     _query_params = st.query_params
 except AttributeError:
-    # 对于旧版 Streamlit，可能需要使用 st.experimental_get_query_params
-    # 但由于 Streamlit 较新版本移除了这个，所以这里尝试兼容
-    try:
-        _query_params = st.experimental_get_query_params()
-    except Exception:
-        _query_params = {}
+    _query_params = st.experimental_get_query_params() # 尝试兼容老版本
 
-_is_self_page = (_query_params.get("page", [""])[0] == "self") if isinstance(_query_params.get("page"), list) else (_query_params.get("page", "") == "self")
+# 统一处理 _query_params 可能返回列表或字符串的情况
+def _get_query_param_value(params_dict, key, default=""):
+    value = params_dict.get(key, default)
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value
+
+_is_self_page = (_get_query_param_value(_query_params, "page") == "self")
 
 
 if _is_self_page:
@@ -553,7 +570,7 @@ else:
 # 初始化 session_state，确保所有键都存在
 for key, val in [("login", False), ("current_admin", ""), ("schedule_result", None),
                  ("user_template_bytes", None), ("temp_new_member", []),
-                 ("temp_pdf_texts", []), ("name_to_pdf_text", {})]:
+                 ("name_to_pdf_text", {})]: # 移除了 temp_pdf_texts，因为其功能已被 name_to_pdf_text 取代
     if key not in st.session_state:
         st.session_state[key] = val
 
@@ -945,4 +962,3 @@ elif menu == "成员自助上传":
                         
                         save_members(all_members_data)
                     st.success("提交成功！AI 已综合识别你所有不能值班的时段。")
-
