@@ -27,12 +27,12 @@ try:
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
     ARK_MODEL = st.secrets["ark"]["model_name"]
-    # 阿里云DashScope：课表文本结构化解析 qwen3.5‑ocr
+    # 阿里云DashScope：课表文本结构化解析 qwen3.5-ocr
     DS_API_KEY = st.secrets["dashscope"]["api_key"]
     DS_ENDPOINT = st.secrets["dashscope"]["endpoint"]
     DS_MODEL_OCR = st.secrets["dashscope"]["model_name"]
 except KeyError:
-    st.error("secrets必须同时配置[ark]、[dashscope]两组密钥！课表用千问qwen3.5‑ocr，个性化用火山doubao2.1‑seed‑pro")
+    st.error("secrets必须同时配置[ark]、[dashscope]两组密钥！课表用千问qwen3.5-ocr，个性化用火山doubao2.1-seed-pro")
     st.stop()
 
 API_TIMEOUT = 30
@@ -40,9 +40,9 @@ MAX_RETRY = 0
 MAX_WORKERS = 4
 
 SHIFT_LIST = [
-    {"shift_idx":0,"shift_name": "9:00‑13:00", "need_stu": 2, "need_wei": 1},
-    {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
-    {"shift_idx":2,"shift_name": "17:00‑20:00", "need_stu": 2, "need_wei": 1}
+    {"shift_idx":0,"shift_name": "9:00-13:00", "need_stu": 2, "need_wei": 1},
+    {"shift_idx":1,"shift_name": "13:00-17:00", "need_stu": 2, "need_wei": 1},
+    {"shift_idx":2,"shift_name": "17:00-20:00", "need_stu": 2, "need_wei": 1}
 ]
 WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
@@ -149,16 +149,16 @@ EXTRACT_SYS_PROMPT = """
 【硬性铁律，违反即为错误】
 1. **只提取原文明确写出来的课程，没有看到的星期、节次绝对禁止编造、推测、脑补！原文没有=结果里不能出现。**
 2. 星期只能取值：周一、周二、周三、周四、周五、周六、周日，不许简写、不许别名。
-3. 节次只允许1‑13的整数；其他数字、文字全部丢弃。
+3. 节次只允许1-13的整数；其他数字、文字全部丢弃。
 4. 字段只能有两个：week、sections；不允许增加任何额外key。
 5. 某个星期完全没有课程，该星期不要写进数组。
 6. 输出**只有纯JSON**，禁止```、注释、说明文字、解释、markdown。
 7. 完整扫描全文，不要漏掉页面下半部分、周六周日课程。
 
 系统标准节次对照表：
-1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
-6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
-10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
+1:08:00-08:45｜2:08:50-09:35｜3:09:50-10:35｜4:10:40-11:25｜5:11:30-12:15
+6:14:05-14:50｜7:14:55-15:40｜8:15:45-16:30｜9:16:40-17:25
+10:17:30-18:15｜11:18:30-19:15｜12:19:20-20:05｜13:20:10-20:55
 
 ✅正确示例：
 [{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
@@ -196,10 +196,10 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# ========= 课表结构化解析：DashScope qwen3.5‑ocr chat接口【增强max_tokens防截断】 =========
+# ========= 课表结构化解析：DashScope qwen3.5-ocr chat接口【增强max_tokens防截断】 =========
 def _call_course_ai(prompt_text:str):
     sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content‑Type": "application/json"}
+    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
     url = DS_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
         "model": DS_MODEL_OCR,
@@ -220,10 +220,10 @@ def _call_course_ai(prompt_text:str):
         raise ValueError("千问OCR：模型没有返回合法JSON数组")
     return json.loads(match.group(0))
 
-# ========= 个性化需求解析：火山方舟 doubao2.1‑seed‑pro【增强max_tokens】 =========
+# ========= 个性化需求解析：火山方舟 doubao2.1-seed-pro【增强max_tokens】 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content‑Type": "application/json"}
+    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
     url = ARK_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
         "model": ARK_MODEL,
@@ -308,7 +308,7 @@ def fast_ai_extract(text:str, personal_need:str=""):
         ai_course_data = cleaned_data
 
         if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen3.5‑ocr；个性化模型：doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen3.5-ocr；个性化模型：doubao2.1-seed-pro (仅管理员批量上传可见)"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
 
         course_conflict = calc_course_conflict(ai_course_data)
@@ -413,8 +413,8 @@ def export_pdf_auto(schedule_data, template_name):
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
     c.setFont(FONT_NAME, 14)
-    c.drawCentredString(w/2, h‑40, "武汉大学学生会值班表")
-    y = h ‑ 70
+    c.drawCentredString(w/2, h-40, "武汉大学学生会值班表")
+    y = h - 70
     if template_name == "武汉大学学生会水印模板":
         c.setFillColorRGB(0.85,0.85,0.85)
         c.setFont(FONT_NAME, 35)
@@ -429,7 +429,7 @@ def export_pdf_auto(schedule_data, template_name):
         y -= 16
         if y < 40:
             c.showPage()
-            y = h‑40
+            y = h-40
             c.setFont(FONT_NAME,9)
     c.save()
     buf.seek(0)
@@ -461,7 +461,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
             for p in entry["职委"]:
                 cell_dict[k]["wei"].append( (p["name"], p.get("phone","")) )
     total_block_height = gap_title + gap_name + gap_phone + gap_name + gap_phone + gap_title + gap_name + gap_phone
-    top_pad = (cell_h ‑ total_block_height) // 2
+    top_pad = (cell_h - total_block_height) // 2
     for shift_idx in range(3):
         for week_idx in range(7):
             cell_data = cell_dict[(shift_idx, week_idx)]
@@ -470,23 +470,23 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
             pos_x = start_x + week_idx * cell_w + 5
             pos_y = start_y + shift_idx * cell_h + top_pad
             cy = pos_y
-            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china‑s")
+            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
             cy += gap_title
             for name, phone in stu_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china‑s")
+                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                 cy += gap_name
                 if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china‑s")
+                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
                     cy += gap_phone
                 else:
                     cy += gap_name
-            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china‑s")
+            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
             cy += gap_title
             for name, phone in wei_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china‑s")
+                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                 cy += gap_name
                 if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china‑s")
+                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
                     cy += gap_phone
                 else:
                     cy += gap_name
@@ -538,14 +538,14 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro｜已增强AI反幻觉准确性")
+        st.caption("分工：课表提取→千问qwen3.5-ocr；个性化需求解析→火山doubao2.1-seed-pro｜已增强AI反幻觉准确性")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接"])
             tab6 = None
         with tab1:
-            st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号‑课表.pdf）")
+            st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号-课表.pdf）")
             up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
             if up_files and st.button("📂 第一步：快速识别姓名、身份、电话，生成预览表格"):
                 with st.spinner("正在本地读取PDF和文件名..."):
@@ -819,7 +819,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro｜已增强AI反幻觉准确性")
+    st.caption("分工：课表提取→千问qwen3.5-ocr；个性化需求解析→火山doubao2.1-seed-pro｜已增强AI反幻觉准确性")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
