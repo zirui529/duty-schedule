@@ -14,11 +14,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
+
 # 火山方舟配置，只读取secrets，不硬编码密钥
 try:
     VOLC_API_KEY = st.secrets["ARK_API_KEY"]
@@ -31,6 +33,7 @@ except KeyError:
 API_TIMEOUT = 30
 MAX_RETRY = 0
 MAX_WORKERS = 4
+
 SHIFT_LIST = [
     {"shift_idx":0,"shift_name": "9:00‑13:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
@@ -40,6 +43,14 @@ WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周�
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
 ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
+
+# 班次时间（分钟 0点起算）
+SHIFT_TIME_MIN = {
+    "上午": (9*60, 13*60),
+    "下午": (13*60, 17*60),
+    "晚上": (17*60, 20*60)
+}
+
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 FONT_NAME = 'STSong-Light'
 
@@ -148,7 +159,6 @@ def _call_course_ai(prompt_text):
 1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
 6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
-
 ⚠️极高优先级强制约束：
 1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。
 2、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1‑13的整数，其他数字一律丢弃。
@@ -177,7 +187,8 @@ def _call_personal_ai(prompt_text):
         "model": MODEL_ID,
         "messages": [
             {"role": "system", "content": """
-只输出JSON字符串数组，内容是【周X上午/下午/晚上】，只能追加，不能删除课表算出的冲突。
+只输出JSON字符串数组，内容是【周X上午/下午/晚上】。
+只解析用户写的个人限制文字，**不要参考课表，不要推断课表信息**，只返回用户额外要求禁止的时段。
 无额外限制返回空数组[]。示例：["周日上午","周二晚上"]
 禁止markdown、禁止解释文字。
 """},
@@ -213,7 +224,7 @@ SECTION_TIME = {
     13:(20*60+10,20*60+55)
 }
 
-# ==========新版冲突计算：课程【开始时间】唯一归属班次，消除跨时段双重冲突==========
+# ========== 修改：完整区间重叠判断，修复跨班次课程漏判 ==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
     for item in ai_course_data:
@@ -222,14 +233,12 @@ def calc_course_conflict(ai_course_data):
         for s in secs:
             if s not in SECTION_TIME:
                 continue
-            c_start, _ = SECTION_TIME[s]
-            if c_start < 13 * 60:
-                shift_name = "上午"
-            elif c_start < 17 * 60:
-                shift_name = "下午"
-            else:
-                shift_name = "晚上"
-            conflict.add(f"{w}{shift_name}")
+            c_start, c_end = SECTION_TIME[s]
+            # 和上午、下午、晚上分别做区间重叠判断
+            for shift_name, (sh_start, sh_end) in SHIFT_TIME_MIN.items():
+                # 区间重叠：not(课程结束<=班次开始 or 班次结束<=课程开始)
+                if not (c_end <= sh_start or sh_end <= c_start):
+                    conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
 def fast_ai_extract(text:str, personal_need:str=""):
@@ -266,10 +275,9 @@ def fast_ai_extract(text:str, personal_need:str=""):
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
+        # 【重要】不再把课表conflict传给AI，只传用户原始文字，杜绝AI参考课表脑补
         prompt_personal = f"""
-课表已经算出不能值班时段：{json.dumps(course_conflict, ensure_ascii=False)}
-用户额外要求：{personal_need}
-只输出用户额外新增禁止的时段，不要包含课表已经有的。
+用户个人限制要求：{personal_need}
 """
         try:
             personal_conflict = _call_personal_ai(prompt_personal)
