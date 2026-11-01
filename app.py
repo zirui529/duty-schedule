@@ -14,26 +14,31 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
-# -------- 固定分工：课表提取=千问qwen3.5；个性化解析=火山方舟(ark) --------
+
+# -------- 固定模型分工 --------
 try:
-    # 火山方舟：只用于【个性化需求解析】
+    # 火山方舟：仅个性化需求解析
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
     ARK_MODEL = st.secrets["ark"]["model_name"]
-    # 阿里云DashScope：只用于【课表文本解析 qwen3.5】
+    # 阿里云DashScope：课表文本结构化解析 qwen3.5‑ocr
     DS_API_KEY = st.secrets["dashscope"]["api_key"]
     DS_ENDPOINT = st.secrets["dashscope"]["endpoint"]
+    DS_MODEL_OCR = st.secrets["dashscope"]["model_name"]
 except KeyError:
-    st.error("secrets必须同时配置[ark]、[dashscope]两组密钥！")
+    st.error("secrets必须同时配置[ark]、[dashscope]两组密钥！课表用千问qwen3.5‑ocr，个性化用火山doubao2.1‑seed‑pro")
     st.stop()
+
 API_TIMEOUT = 30
 MAX_RETRY = 0
 MAX_WORKERS = 4
+
 SHIFT_LIST = [
     {"shift_idx":0,"shift_name": "9:00‑13:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":1,"shift_name": "13:00‑17:00", "need_stu": 2, "need_wei": 1},
@@ -42,15 +47,18 @@ SHIFT_LIST = [
 WEEK_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 TEMPLATE_OPTIONS = ["默认样式", "武汉大学学生会水印模板"]
 SHIFT_PERIOD = {0: "上午", 1: "下午", 2: "晚上"}
-ALL_SLOTS = ["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
+ALL_SLOTS = {"周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"}
+
 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 FONT_NAME = 'STSong-Light'
+
 def safe_str(val):
     if val is None:
         return ""
     if isinstance(val, float) and pd.isna(val):
         return ""
     return str(val).strip()
+
 # ========== 管理员文件读写 ==========
 def init_admin():
     if not os.path.exists(ADMIN_FILE):
@@ -66,27 +74,32 @@ def init_admin():
         except:
             data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
             json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def reset_default_admin():
-    """一键重置admin账号密码为 admin / 123456"""
     data = {"admins": [{"username": "admin", "password": "123456", "is_super": True}]}
     json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def load_admin():
     init_admin()
     return json.load(open(ADMIN_FILE, "r", encoding="utf-8"))
+
 def save_admin(data):
     json.dump(data, open(ADMIN_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 def verify_admin(username, password):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a["password"] == password:
             return a
     return None
+
 def is_super_admin(username):
     data = load_admin()
     for a in data["admins"]:
         if a["username"] == username and a.get("is_super", False):
             return True
     return False
+
 def load_members():
     if os.path.exists(DATA_FILE):
         data = json.load(open(DATA_FILE, "r", encoding="utf-8"))
@@ -99,17 +112,21 @@ def load_members():
                 m["role"] = "学员"
         return data
     return []
+
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
 # ========== PDF读取 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     txt = "".join(page.get_text() for page in doc)
     doc.close()
     return txt
+
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
     return m.group(1).strip() if m else ""
+
 def parse_filename_phone_and_role(filename):
     name_part = filename.split("-课表")[0]
     parts = name_part.split("&")
@@ -125,40 +142,52 @@ def parse_filename_phone_and_role(filename):
         if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
             phone = phone_candidate
     return role, phone
-# ====================== AI调用层【固定分工】 ======================
+
+# ====================== AI提示词【增强准确性，反幻觉】 ======================
 EXTRACT_SYS_PROMPT = """
-你是严谨课表解析器，只从提供的课表原文提取课程，**严禁脑补、严禁凭空编造星期与节次，没有出现在文本里的课程绝对不能输出**。
-本系统标准节次时间：
+你是严谨课表解析工具，任务：从课表原始文本提取课程星期和节次。
+【硬性铁律，违反即为错误】
+1. **只提取原文明确写出来的课程，没有看到的星期、节次绝对禁止编造、推测、脑补！原文没有=结果里不能出现。**
+2. 星期只能取值：周一、周二、周三、周四、周五、周六、周日，不许简写、不许别名。
+3. 节次只允许1‑13的整数；其他数字、文字全部丢弃。
+4. 字段只能有两个：week、sections；不允许增加任何额外key。
+5. 某个星期完全没有课程，该星期不要写进数组。
+6. 输出**只有纯JSON**，禁止```、注释、说明文字、解释、markdown。
+7. 完整扫描全文，不要漏掉页面下半部分、周六周日课程。
+
+系统标准节次对照表：
 1:08:00‑08:45｜2:08:50‑09:35｜3:09:50‑10:35｜4:10:40‑11:25｜5:11:30‑12:15
 6:14:05‑14:50｜7:14:55‑15:40｜8:15:45‑16:30｜9:16:40‑17:25
 10:17:30‑18:15｜11:18:30‑19:15｜12:19:20‑20:05｜13:20:10‑20:55
 
-强制硬性规则，违反视为错误：
-1.星期只允许：周一、周二、周三、周四、周五、周六、周日，不允许简写别名。
-2.节次只能是1‑13之间整数，任何其他数字全部丢弃。
-3.只输出标准JSON数组，每个对象只有两个key：week、sections；sections为整数数组。
-4.完全没有课程的星期，不要写入数组；不要生成空sections。
-5.禁止markdown、禁止```、禁止任何解释、注释、说明文字，直接输出JSON。
-6.仔细阅读全文，不要遗漏周六、周日课程；不要把文字描述、备注当成课程。
+✅正确示例：
+[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
 
-正确输出示例：
-[{"week":"周一","sections":[1,2]},{"week":"周六","sections":[11,12]}]
-错误示例（禁止）：
-[{"week":"周一","sections":[]}]、[{"week":"星期1","sections":[1]}]
+❌错误示例（严禁输出）：
+[{"week":"周一","sections":[2,99]}]  #99不是合法节次
+[{"week":"周1","sections":[1]}]     #星期简写
+[{"note":"xxx"}]                     #多余字段
+[]                                   #原文有课却返回空
+
+只输出JSON，不要任何其他字符。
 """
 
 PERSONAL_SYS_PROMPT = """
-任务：提取用户**额外新增**的禁止值班时段，只输出JSON字符串数组。
-规则：
-1.输出只能是["周X上午","周X下午","周X晚上"]格式，除此之外任何格式不允许。
-2.只提取用户原话新增限制，**不能把课表已经存在的时段再次输出**。
-3.没有额外限制，必须返回空数组 []。
-4.禁止markdown、禁止```标记、禁止解释文字，只输出纯JSON数组。
+任务：解析用户个性化额外禁止值班需求，输出JSON字符串数组。
 
-示例输入：周末不值班
-示例输出：["周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
-示例输入：无特殊要求
-示例输出：[]
+【铁律，必须严格遵守】
+1. **不许重复课表已经识别出的冲突时段！只输出用户额外新增的限制。**
+2. 输出内容只能是固定格式字符串："周X上午"、"周X下午"、"周X晚上"。
+3. 允许全部合法值集合：["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
+4. 用户没有额外限制，直接返回空数组 []。
+5. **禁止脑补、禁止推测用户没有说出来的限制；严格忠于用户输入原话。**
+6. 输出只能纯JSON，禁止```、注释、解释、markdown。
+
+✅正确示例：["周日上午","周二晚上"]
+✅无限制示例：[]
+❌错误示例（严禁）：["周1下午"]、["周一"]、["上午"]、["课表已有时段重复输出"]
+
+只输出JSON，不要任何其他字符。
 """
 
 def _make_http_session():
@@ -166,18 +195,20 @@ def _make_http_session():
     adapt = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1), pool_connections=1, pool_maxsize=1)
     sess.mount("https://", adapt)
     return sess
-# ========= 课表提取：qwen3.5文本模型 =========
+
+# ========= 课表结构化解析：DashScope qwen3.5‑ocr chat接口【增强max_tokens防截断】 =========
 def _call_course_ai(prompt_text:str):
     sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content‑Type": "application/json"}
     url = DS_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
-        "model": "qwen3.5",
+        "model": DS_MODEL_OCR,
         "messages": [
             {"role":"system","content":EXTRACT_SYS_PROMPT},
             {"role":"user","content":prompt_text}
         ],
-        "temperature":0
+        "temperature":0,
+        "max_tokens":2000
     }
     resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
@@ -186,12 +217,13 @@ def _call_course_ai(prompt_text:str):
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("千问：模型没有返回合法JSON数组")
+        raise ValueError("千问OCR：模型没有返回合法JSON数组")
     return json.loads(match.group(0))
-# ========= 个性化需求解析：固定调用 火山方舟 =========
+
+# ========= 个性化需求解析：火山方舟 doubao2.1‑seed‑pro【增强max_tokens】 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content‑Type": "application/json"}
     url = ARK_ENDPOINT.rstrip("/") + "/chat/completions"
     payload = {
         "model": ARK_MODEL,
@@ -199,7 +231,8 @@ def _call_personal_ai(prompt_text:str):
             {"role":"system","content":PERSONAL_SYS_PROMPT},
             {"role":"user","content":prompt_text}
         ],
-        "temperature":0
+        "temperature":0,
+        "max_tokens":1000
     }
     resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
     resp.raise_for_status()
@@ -210,8 +243,12 @@ def _call_personal_ai(prompt_text:str):
     if not match:
         return []
     arr = json.loads(match.group(0))
-    return [s.strip() for s in arr if isinstance(s,str)]
-# 【节次精确时间（分钟，从0点起算）】
+    raw_list = [s.strip() for s in arr if isinstance(s,str)]
+    # 本地强白名单过滤，丢掉不在合法集合的输出，进一步提升准确性
+    filtered = [x for x in raw_list if x in ALL_SLOTS]
+    return filtered
+
+# 节次精确时间(分钟，从0点起算)
 SECTION_TIME = {
     1: (8*60+0, 8*60+45),
     2: (8*60+50, 9*60+35),
@@ -227,13 +264,8 @@ SECTION_TIME = {
     12:(19*60+20,20*60+5),
     13:(20*60+10,20*60+55)
 }
-# ==========新版冲突计算：课程与值班班次做真实时间区间重叠判断==========
+
 def calc_course_conflict(ai_course_data):
-    shift_def = [
-        ("上午", 9 * 60, 13 * 60),
-        ("下午", 13 * 60, 17 * 60),
-        ("晚上", 17 * 60, 20 * 60)
-    ]
     conflict = set()
     for item in ai_course_data:
         w = item["week"]
@@ -241,10 +273,14 @@ def calc_course_conflict(ai_course_data):
         for s in secs:
             if s not in SECTION_TIME:
                 continue
-            c_start, c_end = SECTION_TIME[s]
-            for shift_name, sh_start, sh_end in shift_def:
-                if not (c_end <= sh_start or c_start >= sh_end):
-                    conflict.add(f"{w}{shift_name}")
+            c_start, _ = SECTION_TIME[s]
+            if c_start < 13 * 60:
+                shift_name = "上午"
+            elif c_start < 17 * 60:
+                shift_name = "下午"
+            else:
+                shift_name = "晚上"
+            conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
 def fast_ai_extract(text:str, personal_need:str=""):
@@ -254,18 +290,8 @@ def fast_ai_extract(text:str, personal_need:str=""):
 下面是课表原文，提取里面所有星期和节次：
 {text[:8000]}
 """
-    ALL_VALID_SLOTS = {
-        "周一上午","周一下午","周一晚上",
-        "周二上午","周二下午","周二晚上",
-        "周三上午","周三下午","周三晚上",
-        "周四上午","周四下午","周四晚上",
-        "周五上午","周五下午","周五晚上",
-        "周六上午","周六下午","周六晚上",
-        "周日上午","周日下午","周日晚上"
-    }
     try:
         ai_course_data = _call_course_ai(prompt_course)
-        # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
         valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
         valid_sections = set(range(1,14))
         cleaned_data = []
@@ -280,13 +306,15 @@ def fast_ai_extract(text:str, personal_need:str=""):
             if len(clean_sec)>0:
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
-        # DEBUG折叠面板
+
         if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen3.5；个性化模型：doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen3.5‑ocr；个性化模型：doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
+
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
+
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
@@ -295,11 +323,10 @@ def fast_ai_extract(text:str, personal_need:str=""):
 只输出用户额外新增禁止的时段，不要包含课表已经有的。
 """
         try:
-            raw_personal = _call_personal_ai(prompt_personal)
-            # 白名单过滤，只保留系统合法时段
-            personal_conflict = [s for s in raw_personal if isinstance(s,str) and s in ALL_VALID_SLOTS]
+            personal_conflict = _call_personal_ai(prompt_personal)
         except Exception:
             personal_conflict = []
+
     total = list(set(course_conflict + personal_conflict))
     if not total:
         return "识别为空，请手动填写"
@@ -314,6 +341,7 @@ def is_available(member, week_idx, shift_idx):
     if class_conflict and class_conflict != "无" and conflict_str in class_conflict:
         return False
     return True
+
 # ========== 智能排班 ==========
 def smart_schedule(member_list):
     stu_pool = [m for m in member_list if m["role"]=="学员"]
@@ -378,14 +406,15 @@ def smart_schedule(member_list):
     if wei_pool:
         st.success(f"✅ 职委排班完成：共 {len(wei_pool)} 名职委，平均每人排 {sum(wei_count.values())/len(wei_pool):.1f} 班")
     return schedule
+
 # ========== 模式A：系统自动生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
     c.setFont(FONT_NAME, 14)
-    c.drawCentredString(w/2, h-40, "武汉大学学生会值班表")
-    y = h - 70
+    c.drawCentredString(w/2, h‑40, "武汉大学学生会值班表")
+    y = h ‑ 70
     if template_name == "武汉大学学生会水印模板":
         c.setFillColorRGB(0.85,0.85,0.85)
         c.setFont(FONT_NAME, 35)
@@ -400,11 +429,12 @@ def export_pdf_auto(schedule_data, template_name):
         y -= 16
         if y < 40:
             c.showPage()
-            y = h-40
+            y = h‑40
             c.setFont(FONT_NAME,9)
     c.save()
     buf.seek(0)
     return buf
+
 # ========== 模式B：填充用户模板 ==========
 def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset_y:int=-30):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
@@ -431,7 +461,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
             for p in entry["职委"]:
                 cell_dict[k]["wei"].append( (p["name"], p.get("phone","")) )
     total_block_height = gap_title + gap_name + gap_phone + gap_name + gap_phone + gap_title + gap_name + gap_phone
-    top_pad = (cell_h - total_block_height) // 2
+    top_pad = (cell_h ‑ total_block_height) // 2
     for shift_idx in range(3):
         for week_idx in range(7):
             cell_data = cell_dict[(shift_idx, week_idx)]
@@ -440,23 +470,23 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
             pos_x = start_x + week_idx * cell_w + 5
             pos_y = start_y + shift_idx * cell_h + top_pad
             cy = pos_y
-            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
+            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china‑s")
             cy += gap_title
             for name, phone in stu_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
+                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china‑s")
                 cy += gap_name
                 if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china‑s")
                     cy += gap_phone
                 else:
                     cy += gap_name
-            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
+            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china‑s")
             cy += gap_title
             for name, phone in wei_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
+                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china‑s")
                 cy += gap_name
                 if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china‑s")
                     cy += gap_phone
                 else:
                     cy += gap_name
@@ -465,6 +495,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     doc.close()
     out_buf.seek(0)
     return out_buf
+
 # ========== 页面入口 ==========
 st.set_page_config(page_title="值班排班系统", layout="wide")
 if "login" not in st.session_state:
@@ -507,7 +538,7 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("分工：课表提取→千问qwen3.5；个性化需求解析→火山doubao2.1‑seed‑pro")
+        st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro｜已增强AI反幻觉准确性")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -788,7 +819,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("分工：课表提取→千问qwen3.5；个性化需求解析→火山doubao2.1‑seed‑pro")
+    st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro｜已增强AI反幻觉准确性")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
