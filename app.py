@@ -155,12 +155,11 @@ def parse_filename_phone_and_role(filename):
         else:
             role = "学员"
         phone_candidate = parts[2].strip()
-        try:
-            # 重新字面检查 regex 模式
-            if re.fullmatch(r"1[3-9]\d{9}", phone_candidate):
-                phone = phone_candidate
-        except re.error: # 如果正则表达式本身有问题，捕获并忽略
-            phone = ""
+        # CRITICAL CHANGE: 彻底移除正则表达式，改为简单的字符串检查
+        if len(phone_candidate) == 11 and phone_candidate.isdigit() and phone_candidate.startswith('1'):
+            phone = phone_candidate
+        else:
+            phone = "" # 如果不符合简单规则，则认为不是有效手机号
     return role, phone
 
 # ========== AI 调用（带防幻觉） ==========
@@ -226,7 +225,7 @@ def _call_course_ai(prompt_text):
     out = re.sub(r"\n```$", "", out)       
     match = re.search(r"\\[.*\\\]", out, re.DOTALL) 
     if not match:
-        raise ValueError("模型返回数据不包含合法的 JSON 数组")
+        raise ValueError(f"模型返回数据不包含合法的 JSON 数组。原始输出：{out[:500]}") # 增加原始输出以便调试
     return json.loads(match.group(0))
 
 def _call_personal_ai(prompt_text):
@@ -312,12 +311,8 @@ def fast_ai_extract(text, personal_need=""):
 课表原文：
 {text[:8000]}
 """
-    # 局部变量用于捕获 _call_course_ai 内部可能的原始输出
-    _ai_raw_out = "" 
     try:
         ai_course_data = _call_course_ai(prompt_course)
-        # 如果 _call_course_ai 成功，其内部的原始输出在这里已经处理过，
-        # 所以_ai_raw_out只有在_call_course_ai内部出错时才有意义
         
         valid_weeks = set(WEEK_NAMES)
         cleaned = {}
@@ -339,10 +334,7 @@ def fast_ai_extract(text, personal_need=""):
                 
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
-        # 如果捕获到异常，检查是否有原始模型输出，并打印到控制台或日志
-        st.error(f"DEBUG: 课表识别内部错误，异常信息: {e}. ")
-        # if _ai_raw_out:
-        #     st.error(f"DEBUG: 导致错误的原始模型输出（可能在_call_course_ai内部）: {_ai_raw_out}")
+        # 统一捕获并返回错误信息
         return f"课表识别失败:{str(e)[:60]}"
 
     personal_conflict = []
