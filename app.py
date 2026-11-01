@@ -274,12 +274,11 @@ def calc_course_conflict(ai_course_data):
 
 
 def fast_ai_extract(text:str, personal_need:str=""):
-    debug_html = ""
     debug_json_str = ""
     debug_calc_detail = []
     final_conflict_str = ""
     if not text or len(text.strip()) < 10:
-        return "课表文本提取失败，请手动填写"
+        return {"result": "课表文本提取失败，请手动填写", "debug_json": "", "debug_calc": []}
     prompt_course = f"""
 下面是课表原文，提取里面所有星期和节次：
 {text[:8000]}
@@ -306,7 +305,7 @@ def fast_ai_extract(text:str, personal_need:str=""):
         course_conflict, debug_calc_detail = calc_course_conflict(ai_course_data)
 
     except Exception as e:
-        return f"课表识别失败:{str(e)[:60]}"
+        return {"result": f"课表识别失败:{str(e)[:60]}", "debug_json": "", "debug_calc": []}
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
@@ -323,12 +322,7 @@ def fast_ai_extract(text:str, personal_need:str=""):
     else:
         final_conflict_str = "、".join(sorted(total))
 
-    # -------- 把调试信息存入st.session_state，页面上渲染 --------
-    st.session_state["debug_ai_raw_json"] = debug_json_str
-    st.session_state["debug_calc_steps"] = debug_calc_detail
-    st.session_state["debug_final_conflict"] = final_conflict_str
-
-    return final_conflict_str
+    return {"result": final_conflict_str, "debug_json": debug_json_str, "debug_calc": debug_calc_detail}
 
 # ========== 判断某人在某时段是否有空 ==========
 def is_available(member, week_idx, shift_idx):
@@ -508,12 +502,6 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_texts" not in st.session_state:
     st.session_state.temp_pdf_texts = []
-if "debug_ai_raw_json" not in st.session_state:
-    st.session_state.debug_ai_raw_json = ""
-if "debug_calc_steps" not in st.session_state:
-    st.session_state.debug_calc_steps = []
-if "debug_final_conflict" not in st.session_state:
-    st.session_state.debug_final_conflict = ""
 
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
@@ -562,7 +550,9 @@ if menu == "管理员后台":
                             "phone": phone_from_file,
                             "role": role_from_file,
                             "class_conflict": "",
-                            "personal_need": ""
+                            "personal_need": "",
+                            "debug_json": "",
+                            "debug_calc": []
                         })
                     st.session_state.temp_pdf_texts = texts
                     seen = set()
@@ -605,9 +595,14 @@ if menu == "管理员后台":
                                     for fut in as_completed(futures):
                                         idx = futures[fut]
                                         try:
-                                            current_rows[idx]["class_conflict"] = fut.result()
+                                            res_data = fut.result()
+                                            current_rows[idx]["class_conflict"] = res_data["result"]
+                                            current_rows[idx]["debug_json"] = res_data["debug_json"]
+                                            current_rows[idx]["debug_calc"] = res_data["debug_calc"]
                                         except Exception as e:
                                             current_rows[idx]["class_conflict"] = f"识别失败: {str(e)[:60]}"
+                                            current_rows[idx]["debug_json"] = ""
+                                            current_rows[idx]["debug_calc"] = []
                                         done += 1
                                         bar.progress(done/len(need_ai_texts))
                             for row in current_rows:
@@ -646,18 +641,22 @@ if menu == "管理员后台":
                         st.session_state.temp_pdf_texts = []
                         st.rerun()
 
-                # ========== 网页直接渲染全部调试信息 ==========
+                # ========== 逐行展开调试面板 ==========
                 st.divider()
-                st.subheader("🔍DEBUG调试信息（网页直接看，无需终端）")
-                if st.session_state.get("debug_ai_raw_json"):
-                    st.markdown("**1.AI输出原始课表JSON**")
-                    st.code(st.session_state["debug_ai_raw_json"], language="json")
-                if st.session_state.get("debug_calc_steps"):
-                    st.markdown("**2.逐条课→班次冲突运算过程**")
-                    st.dataframe(st.session_state["debug_calc_steps"])
-                if st.session_state.get("debug_final_conflict"):
-                    st.markdown("**3.最终输出冲突字符串**")
-                    st.text(st.session_state["debug_final_conflict"])
+                st.subheader("🔍 单行调试面板（展开查看对应人员的识别日志）")
+                for idx, row in enumerate(st.session_state.temp_new_member):
+                    name = row["name"]
+                    dj = row.get("debug_json","")
+                    dc = row.get("debug_calc",[])
+                    with st.expander(f"【{name}】点击展开DEBUG"):
+                        if dj:
+                            st.markdown("**1. AI原始输出JSON**")
+                            st.code(dj, language="json")
+                        if dc:
+                            st.markdown("**2. 逐条课程-班次冲突运算表**")
+                            st.dataframe(dc)
+                        st.markdown("**3. 最终冲突字符串**")
+                        st.text(row["class_conflict"])
 
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
@@ -844,7 +843,8 @@ elif menu == "成员自助上传":
             else:
                 with st.spinner("AI正在综合分析你的课表和个性化需求..."):
                     txt = get_pdf_full_text(pdf_file.read())
-                    class_conflict = fast_ai_extract(txt, limit_input)
+                    ret = fast_ai_extract(txt, limit_input)
+                    class_conflict = ret["result"]
                     personal_need = safe_str(limit_input)
                     all_mem = load_members()
                     exist = False
