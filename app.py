@@ -21,19 +21,18 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 
-# -------- 双服务商配置，全部从secrets读取 --------
+# -------- 固定分工：课表提取=千问OCR(dashscope)；个性化解析=火山方舟(ark) --------
 try:
-    PROVIDER = st.secrets["provider"]
-    # 火山方舟 ark
+    # 火山方舟：只用于【个性化需求解析】
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
     ARK_MODEL = st.secrets["ark"]["model_name"]
-    # 阿里云 dashscope
+    # 阿里云DashScope：只用于【课表PDF内容提取 qwen3.5‑ocr】
     DS_API_KEY = st.secrets["dashscope"]["api_key"]
     DS_ENDPOINT = st.secrets["dashscope"]["endpoint"]
-    DS_MODEL = st.secrets["dashscope"]["model_name"]
+    DS_MODEL_OCR = st.secrets["dashscope"]["model_name"]
 except KeyError:
-    st.error("secrets缺少配置：provider / [ark] / [dashscope]")
+    st.error("secrets必须同时配置[ark]、[dashscope]两组密钥！课表用千问OCR，个性化用火山")
     st.stop()
 
 API_TIMEOUT = 30
@@ -146,7 +145,7 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== 双模型调用层【修复连接池：独立session，限制连接，3次重试】 ======================
+# ====================== AI调用层【固定分工】 ======================
 EXTRACT_SYS_PROMPT = """
 你是课表提取工具，**只输出JSON数组，绝对不能输出任何说明、注释、markdown、```符号**。
 下面是本系统全部节次标准时间：
@@ -173,35 +172,15 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-def call_ark_course(text:str):
-    sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": ARK_MODEL,
-        "messages": [
-            {"role":"system","content":EXTRACT_SYS_PROMPT},
-            {"role":"user","content":text}
-        ],
-        "temperature":0
-    }
-    resp = sess.post(ARK_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    out = resp.json()["choices"][0]["message"]["content"].strip()
-    out = re.sub(r"^```[^\n]*\n", "", out)
-    out = re.sub(r"\n```$", "", out)
-    match = re.search(r"\[.*\]", out, re.DOTALL)
-    if not match:
-        raise ValueError("模型没有返回合法JSON数组")
-    return json.loads(match.group(0))
-
-def call_dashscope_course(text:str):
+# ========= 课表提取：固定调用 DashScope qwen3.5‑ocr =========
+def _call_course_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": DS_MODEL,
+        "model": DS_MODEL_OCR,
         "messages": [
             {"role":"system","content":EXTRACT_SYS_PROMPT},
-            {"role":"user","content":text}
+            {"role":"user","content":prompt_text}
         ],
         "temperature":0
     }
@@ -212,17 +191,18 @@ def call_dashscope_course(text:str):
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("模型没有返回合法JSON数组")
+        raise ValueError("千问OCR：模型没有返回合法JSON数组")
     return json.loads(match.group(0))
 
-def call_ark_personal(text:str):
+# ========= 个性化需求解析：固定调用 火山方舟 doubao2.1‑seed‑pro =========
+def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": ARK_MODEL,
         "messages": [
             {"role":"system","content":PERSONAL_SYS_PROMPT},
-            {"role":"user","content":text}
+            {"role":"user","content":prompt_text}
         ],
         "temperature":0
     }
@@ -236,45 +216,6 @@ def call_ark_personal(text:str):
         return []
     arr = json.loads(match.group(0))
     return [s.strip() for s in arr if isinstance(s,str)]
-
-def call_dashscope_personal(text:str):
-    sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {DS_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": DS_MODEL,
-        "messages": [
-            {"role":"system","content":PERSONAL_SYS_PROMPT},
-            {"role":"user","content":text}
-        ],
-        "temperature":0
-    }
-    resp = sess.post(DS_ENDPOINT, headers=headers, json=payload, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    out = resp.json()["choices"][0]["message"]["content"].strip()
-    out = re.sub(r"^```[^\n]*\n", "", out)
-    out = re.sub(r"\n```$", "", out)
-    match = re.search(r"\[.*\]", out, re.DOTALL)
-    if not match:
-        return []
-    arr = json.loads(match.group(0))
-    return [s.strip() for s in arr if isinstance(s,str)]
-
-# 统一分发入口
-def _call_course_ai(prompt_text):
-    if PROVIDER == "ark":
-        return call_ark_course(prompt_text)
-    elif PROVIDER == "dashscope":
-        return call_dashscope_course(prompt_text)
-    else:
-        raise ValueError(f"不支持的provider:{PROVIDER}")
-
-def _call_personal_ai(prompt_text):
-    if PROVIDER == "ark":
-        return call_ark_personal(prompt_text)
-    elif PROVIDER == "dashscope":
-        return call_dashscope_personal(prompt_text)
-    else:
-        raise ValueError(f"不支持的provider:{PROVIDER}")
 
 # 【节次精确时间（分钟，从0点起算）】
 SECTION_TIME = {
@@ -336,9 +277,9 @@ def fast_ai_extract(text:str, personal_need:str=""):
             if len(clean_sec)>0:
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
-        # DEBUG折叠面板，仅streamlit页面环境输出
+        # DEBUG折叠面板
         if st.runtime.exists():
-            with st.expander(f"🔍DEBUG AI读取原始课表｜当前模型:{PROVIDER}(仅管理员批量上传可见)"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen3.5‑ocr；个性化模型：doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
@@ -560,7 +501,7 @@ if menu == "管理员后台":
                 st.error("账号或密码错误（默认账号：admin，密码：123456）")
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption(f"当前生效模型服务商：{PROVIDER}，切换修改secrets的provider字段")
+        st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -841,7 +782,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption(f"当前模型服务商：{PROVIDER}")
+    st.caption("分工：课表提取→千问qwen3.5‑ocr；个性化需求解析→火山doubao2.1‑seed‑pro")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
