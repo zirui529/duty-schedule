@@ -8,3 +8,4 @@ requests
 Pillow
 python-dateutil
 dashscope
+pdfplumber
