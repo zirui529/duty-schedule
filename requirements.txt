@@ -1,7 +1,8 @@
 streamlit
-pdfplumber
 pymupdf
 dashscope
-openai
+requests
+pandas
+reportlab
+pdfplumber
 numpy
-pillow
