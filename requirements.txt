@@ -7,4 +7,4 @@ reportlab
 requests
 Pillow
 python-dateutil
-
+dashscope
