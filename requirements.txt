@@ -1,9 +1,7 @@
 streamlit
-pymupdf
-pandas
-dashscope
-reportlab
-requests
-urllib3
 pdfplumber
+pymupdf
+dashscope
+volcenginesdkarkruntime
+numpy
 pillow
