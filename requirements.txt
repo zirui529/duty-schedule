@@ -2,6 +2,6 @@ streamlit
 pdfplumber
 pymupdf
 dashscope
-volcenginesdkarkruntime
+openai
 numpy
 pillow
