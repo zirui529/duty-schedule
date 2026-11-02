@@ -16,6 +16,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+import pdfplumber
 
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
@@ -114,11 +115,18 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========= PDF工具 =========
+# ========= PDF工具（pdfplumber优先提取表格，适配武大教务课表） =========
 def get_pdf_full_text(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    txt = "".join(page.get_text() for page in doc)
-    doc.close()
+    txt = ""
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if table:
+                for row in table:
+                    row_text = " ".join([str(cell) for cell in row if cell is not None])
+                    txt += row_text + "\n"
+            page_text = page.extract_text() or ""
+            txt += page_text + "\n"
     return txt
 
 def extract_name_from_text(text):
@@ -141,13 +149,14 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== 提示词【测试版，强制输出数组】 ======================
+# ====================== 提示词【强防幻觉版本，禁止脑补课程】 ======================
 EXTRACT_SYS_PROMPT = """
-你是课表提取工具，只输出JSON数组，禁止任何解释、禁止多余文字、禁止markdown注释。
+你是课表提取工具，只输出JSON数组，禁止任何解释、多余文字、markdown注释。
+⚠️【硬性铁则】：只提取用户提供原文里明确写出来的课程！原文没有出现的星期和节次，一律不要写，严禁编造、脑补任何课程！
 读取课表文本，提取课程星期与节次。
 规则：
-1.只提取原文明确出现的课程，禁止脑补，没有课程返回[]
-2.week：周一、周二、周三、周四、周五、周六、周日
+1.找不到任何课程，直接返回空数组 []
+2.week：只能是["周一","周二","周三","周四","周五","周六","周日"]
 3.sections：节次数字，1‑13
 4.输出格式示例：[{"week":"周一","sections":[1,3]},{"week":"周六","sections":[11]}]
 5.只输出JSON，别的文字一个都不要写！
@@ -169,7 +178,7 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# =========【千问 qwen‑plus 测试版，带调试返回原始内容】 =========
+# =========【千问 qwen‑plus 测试版，带调试返回原始内容，temperature=0】 =========
 def _call_course_ai(prompt_text:str):
     resp = Generation.call(
         model="qwen-plus",
@@ -268,7 +277,7 @@ def calc_course_conflict(ai_course_data):
 def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
     pdf_text = get_pdf_full_text(pdf_bytes)
     debug_info = {
-        "pdf_extract_text": pdf_text[:1200] if pdf_text else "【PDF提取文本为空！大概率是扫描图片PDF】",
+        "pdf_extract_text": pdf_text[:1200] if pdf_text else "【PDF提取文本为空！】",
         "ai_raw_output":"",
         "ai_parsed":None
     }
@@ -485,7 +494,7 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     return out_buf
 
 # ========== 页面入口 ==========
-st.set_page_config(page_title="值班排班系统【测试调试版】", layout="wide")
+st.set_page_config(page_title="值班排班系统【防幻觉调试版】", layout="wide")
 if "login" not in st.session_state:
     st.session_state.login = False
 if "current_admin" not in st.session_state:
@@ -508,7 +517,7 @@ else:
     menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
 if menu == "管理员后台":
     if not st.session_state.login:
-        st.title("管理员登录【测试调试版】")
+        st.title("管理员登录【防幻觉调试版】")
         admin_user = st.text_input("管理员账号")
         pwd_in = st.text_input("输入密码", type="password")
         col1, col2 = st.columns(2)
@@ -527,8 +536,8 @@ if menu == "管理员后台":
                 st.success("✅ 重置完成！现在账号admin，密码123456，直接登录")
                 st.rerun()
     else:
-        st.title(f"管理员后台｜排班管理【测试调试版】（当前登录：{st.session_state.current_admin}）")
-        st.caption("调试版：会输出PDF提取文本、AI原始返回，定位识别为空根源；模型：qwen‑plus；火山：doubao2.1‑seed‑pro")
+        st.title(f"管理员后台｜排班管理【防幻觉调试版】（当前登录：{st.session_state.current_admin}）")
+        st.caption("调试版：pdfplumber读取表格PDF；千问强制禁止脑补课表；火山：doubao2.1‑seed‑pro")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -544,9 +553,7 @@ if menu == "管理员后台":
                     for f in up_files:
                         b = f.read()
                         pdf_bytes_list.append(b)
-                        doc_tmp = fitz.open(stream=b, filetype="pdf")
-                        txt_tmp = doc_tmp[0].get_text()
-                        doc_tmp.close()
+                        txt_tmp = get_pdf_full_text(b)
                         name = extract_name_from_text(txt_tmp)
                         role_from_file, phone_from_file = parse_filename_phone_and_role(f.name)
                         if not name:
@@ -827,7 +834,7 @@ if menu == "管理员后台":
             st.session_state.current_admin = ""
             st.rerun()
 elif menu == "成员自助上传":
-    st.title("成员自助提交信息 & 上传课表【测试调试版】")
+    st.title("成员自助提交信息 & 上传课表【防幻觉调试版】")
     st.caption("自助页面无调试面板，优先管理员批量上传页面看DEBUG信息")
     with st.form("member_form"):
         name = st.text_input("姓名")
