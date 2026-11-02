@@ -16,8 +16,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 import dashscope
 from dashscope import Generation
-import numpy as np
-import pdfplumber
 
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
@@ -115,59 +113,27 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取【升级版本：优先坐标生成规整Markdown表格，异常自动回退fitz原版】 ==========
+# ========== PDF读取：只用fitz，过滤打印时间、学号等干扰文本；识别扫描图片PDF ==========
 def get_pdf_full_text(pdf_bytes):
-    row_count = 13
-    col_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    col_count = len(col_names)
-    grid = [["" for _ in range(col_count)] for _ in range(row_count)]
-    try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                words = page.extract_words()
-                if not words or len(words) < 5:
-                    continue
-                all_y = [w["top"] for w in words]
-                ys = np.array(all_y)
-                y_low = np.percentile(ys, 10)
-                y_high = np.percentile(ys, 90)
-                table_words = [w for w in words if (y_low <= w["top"] <= y_high)]
-                if len(table_words) < 3:
-                    table_words = words
-
-                table_x = [w["x0"] for w in table_words]
-                table_y = [w["top"] for w in table_words]
-                x_min, x_max = min(table_x), max(table_x)
-                y_min, y_max = min(table_y), max(table_y)
-
-                cell_w = (x_max - x_min) / col_count
-                cell_h = (y_max - y_min) / row_count
-
-                for w in table_words:
-                    wx = w["x0"]
-                    wy = w["top"]
-                    rel_x = wx - x_min
-                    rel_y = wy - y_min
-                    col_idx = int(rel_x / cell_w)
-                    row_idx = int(rel_y / cell_h)
-                    if 0 <= col_idx < col_count and 0 <= row_idx < row_count:
-                        grid[row_idx][col_idx] += w["text"] + " "
-        # 输出规整markdown表格
-        md_lines = ["| 节次 | " + " | ".join(col_names) + " |",
-                    "| ---- | " + " | ".join(["----"] * col_count) + " |"]
-        for r in range(row_count):
-            line = f"| {r+1} | " + " | ".join(grid[r]) + " |"
-            md_lines.append(line)
-        table_text = "\n".join(md_lines)
-        table_text = re.sub(r"打印时间[:：].*", "", table_text)
-        table_text = re.sub(r"学号[:：].*", "", table_text)
-        return table_text
-    except Exception:
-        # 降级回原始fitz逻辑
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        txt = "".join(page.get_text() for page in doc)
-        doc.close()
-        return txt
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    clean_lines = []
+    for page in doc:
+        raw = page.get_text()
+        lines = raw.splitlines()
+        for ln in lines:
+            l = ln.strip()
+            if not l:
+                continue
+            # 过滤无关噪声
+            if re.search(r"打印时间|学号|姓名|第.*页|页码|武汉大学.*课表", l):
+                continue
+            clean_lines.append(l)
+    doc.close()
+    output_text = "\n".join(clean_lines)
+    # 判断扫描图片PDF：提取得到文字过少
+    if len(output_text.replace("\n","").strip()) < 120:
+        return "【SCAN_PDF】扫描图片课表，无法文本识别，请手动填写冲突时段"
+    return output_text
 
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
@@ -192,7 +158,7 @@ def parse_filename_phone_and_role(filename):
 # ====================== AI提示词【抗幻觉】 ======================
 EXTRACT_SYS_PROMPT = """
 你是严谨课表提取工具。
-⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
+⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。空白单元格代表无课，不能当做有课！**
 1.星期只能：周一、周二、周三、周四、周五、周六、周日，不许简写。
 2.节次只允许1‑13的整数，其余全部丢弃。
 3.输出字段仅允许week、sections，不能增加任何别的key。
@@ -222,8 +188,12 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# =========【修复！千问 qwen‑max 使用 dashscope Generation.call，输入文本，不再传PDF二进制】 =========
+# =========【千问调用，增加幻觉拦截：七天全部识别有课直接返回空数组】 =========
 def _call_course_ai(prompt_text:str):
+    # 扫描PDF标记直接抛出
+    if prompt_text.startswith("【SCAN_PDF】"):
+        raise ValueError(prompt_text)
+
     resp = Generation.call(
         model="qwen-plus",
         messages=[
@@ -242,7 +212,27 @@ def _call_course_ai(prompt_text:str):
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
         raise ValueError("千问：没有返回合法JSON数组")
-    return json.loads(match.group(0))
+    raw_data = json.loads(match.group(0))
+
+    valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
+    valid_sections = set(range(1,14))
+    cleaned_data = []
+    used_weeks = set()
+    for entry in raw_data:
+        if not isinstance(entry,dict):
+            continue
+        w = entry.get("week","")
+        sec_list = entry.get("sections",[])
+        if w not in valid_weeks:
+            continue
+        clean_sec = [x for x in sec_list if isinstance(x,int) and x in valid_sections]
+        if len(clean_sec)>0:
+            cleaned_data.append({"week":w,"sections":clean_sec})
+            used_weeks.add(w)
+    # 幻觉强拦截：七天全部识别有课，直接返回空数组，避免“满课”bug
+    if len(used_weeks) >=7:
+        return []
+    return cleaned_data
 
 # ========= 火山方舟doubao，关闭深度思考，防止脑补 =========
 def _call_personal_ai(prompt_text:str):
@@ -333,6 +323,9 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
         ai_course_data = cleaned_data
         if st.runtime.exists():
             with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑max‑latest；个性化模型：doubao2.1‑seed‑pro"):
+                st.text("=====传给AI的原始PDF文本====")
+                st.code(text[:3000])
+                st.text("=====AI输出解析结果====")
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
