@@ -5,8 +5,6 @@ import json
 import os
 import re
 import random
-import dashscope
-from dashscope import Response
 from io import BytesIO
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +14,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+import dashscope
+from dashscope import Generation
 
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
@@ -23,15 +23,13 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 
-# -------- 【焊死分工】 --------
-# qwen3.5‑ocr(阿里云Response非对话接口): PDF二进制 -> 原始课表纯文本，不做JSON结构化
-# doubao2.1‑seed‑pro(火山chat): 1.原始文本提取week+sections JSON；2.解析用户个性化需求
+# -------- 分工 --------
+# qwen-max dashscope Generation.call(文本)：fitz提取PDF文本之后做课表JSON解析
+# doubao2.1‑seed‑pro 火山chat：个性化需求解析
 try:
-    # 火山方舟：结构化课表解析 + 个性化需求解析
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
     ARK_MODEL = st.secrets["ark"]["model_name"]
-    # 阿里云dashscope，qwen3.5‑ocr，仅做PDF OCR文本抽取
     DS_API_KEY = st.secrets["dashscope"]["api_key"]
     dashscope.api_key = DS_API_KEY
 except KeyError:
@@ -119,19 +117,12 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========= PDF工具：qwen3.5‑ocr【非对话Response接口，输入PDF二进制，返回原始文本】 =========
-def qwen_ocr_pdf_get_raw_text(pdf_bytes:bytes) -> str:
-    resp = Response.create(
-        model="qwen3.5-ocr",
-        input=pdf_bytes,
-        parameters={
-            "prompt":"提取这份PDF全部课表原始文字，只输出文档文本，不要总结、不要处理，原样输出内容。"
-        }
-    )
-    if resp.status_code != 200:
-        raise Exception(f"qwen3.5‑ocr调用失败 code:{resp.status_code} msg:{resp.message}")
-    raw_text = resp.output.text
-    return raw_text
+# ========== PDF读取，fitz提取PDF纯文本 ==========
+def get_pdf_full_text(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    txt = "".join(page.get_text() for page in doc)
+    doc.close()
+    return txt
 
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
@@ -153,25 +144,35 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== AI提示词 ======================
+# ====================== AI提示词【抗幻觉】 ======================
 EXTRACT_SYS_PROMPT = """
-你是课表提取工具，**只输出JSON数组，绝对不能输出任何说明、注释、markdown、```符号**。
-下面是本系统全部节次标准时间：
+你是严谨课表提取工具。
+⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
+
+1.星期只能：周一、周二、周三、周四、周五、周六、周日，不许简写。
+2.节次只允许1‑13的整数，其余全部丢弃。
+3.输出字段仅允许week、sections，不能增加任何别的key。
+4.某星期完全无课，该星期不要写入数组。
+5.只输出纯净JSON数组，禁止```、注释、markdown、任何解释文字。
+
+节次参考：
 1:08:00-08:45｜2:08:50-09:35｜3:09:50-10:35｜4:10:40-11:25｜5:11:30-12:15
 6:14:05-14:50｜7:14:55-15:40｜8:15:45-16:30｜9:16:40-17:25
 10:17:30-18:15｜11:18:30-19:15｜12:19:20-20:05｜13:20:10-20:55
-⚠️极高优先级强制约束：
-1、**没有在课表文本中明确看到的星期+节次，绝对不能写进结果，禁止脑补、禁止推测、禁止凭空生成课程**。
-2、星期只能是：周一、周二、周三、周四、周五、周六、周日；节次只能1-13的整数，其他数字一律丢弃。
-3、遍历全部文本，不要忽略页面后半段、周六、周日课程；如果某星期完全没有课，该星期不要出现在数组。
-4、输出格式固定，示例：[{"week":"周一","sections":[1,3,10]},{"week":"周六","sections":[11,12]}]
-5、不要合并、不要改写星期名称；不要增加额外字段，只保留week、sections两个key。
+
+✅正确示例：[{"week":"周一","sections":[1,3]},{"week":"周六","sections":[11]}]
 """
 
 PERSONAL_SYS_PROMPT = """
-只输出JSON字符串数组，内容是【周X上午/下午/晚上】，只能追加，不能删除课表算出的冲突。
-无额外限制返回空数组[]。示例：["周日上午","周二晚上"]
-禁止markdown、禁止解释文字。
+任务：解析用户个性化额外禁止值班需求，输出JSON字符串数组。
+铁律：
+1. 不许重复课表已经算出的冲突时段！**只提取用户原话明确说出的限制，禁止脑补、禁止联想额外限制。**
+2.输出只能是："周X上午"、"周X下午"、"周X晚上"
+3.合法集合：["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
+4.没有额外限制返回[]。
+5.只输出纯JSON，禁止markdown、注释、解释。
+✅示例：["周日上午","周二晚上"]
+✅无限制示例：[]
 """
 
 def _make_http_session():
@@ -180,32 +181,29 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# ========= 火山方舟：课表原始文本 → 结构化week+sections JSON =========
+# =========【修复！千问 qwen‑max 使用 dashscope Generation.call，输入文本，不再传PDF二进制】 =========
 def _call_course_ai(prompt_text:str):
-    sess = _make_http_session()
-    headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
-    url = ARK_ENDPOINT.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": ARK_MODEL,
-        "messages": [
+    resp = Generation.call(
+        model="qwen-max-latest",
+        messages=[
             {"role":"system","content":EXTRACT_SYS_PROMPT},
             {"role":"user","content":prompt_text}
         ],
-        "temperature":0,
-        "max_tokens":2000,
-        "extra_body":{"thinking":{"type":"disabled"}}
-    }
-    resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    out = resp.json()["choices"][0]["message"]["content"].strip()
+        temperature=0.0,
+        max_tokens=2000,
+        result_format="message"
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"千问API异常 code:{resp.status_code} {resp.message}")
+    out = resp.output.choices[0].message.content.strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("火山模型：没有返回合法JSON数组")
+        raise ValueError("千问：没有返回合法JSON数组")
     return json.loads(match.group(0))
 
-# ========= 火山方舟：个性化需求解析 =========
+# ========= 火山方舟doubao，关闭深度思考，防止脑补 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
@@ -233,7 +231,7 @@ def _call_personal_ai(prompt_text:str):
     filtered = [x for x in raw_list if x in ALL_SLOTS]
     return filtered
 
-# 【节次精确时间（分钟，从0点起算）】
+# 节次时间(分钟，从0点起算)
 SECTION_TIME = {
     1: (8*60+0, 8*60+45),
     2: (8*60+50, 9*60+35),
@@ -250,7 +248,6 @@ SECTION_TIME = {
     13:(20*60+10,20*60+55)
 }
 
-# ==========新版冲突计算：课程【开始时间】唯一归属班次，消除跨时段双重冲突==========
 def calc_course_conflict(ai_course_data):
     conflict = set()
     for item in ai_course_data:
@@ -270,22 +267,15 @@ def calc_course_conflict(ai_course_data):
     return sorted(list(conflict))
 
 def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
-    # 链路：pdf_bytes → qwen3.5‑ocr(非对话Response接口)拿原始文本 → 火山做结构化
-    try:
-        raw_text = qwen_ocr_pdf_get_raw_text(pdf_bytes)
-    except Exception as e:
-        return f"qwen3.5‑ocr PDF识别失败:{str(e)[:60]}，请手动填写"
-
-    if not raw_text or len(raw_text.strip()) < 10:
-        return "课表OCR文本提取为空，请手动填写"
-
+    text = get_pdf_full_text(pdf_bytes)
+    if not text or len(text.strip()) < 10:
+        return "课表文本提取失败，请手动填写"
     prompt_course = f"""
 下面是课表原文，提取里面所有星期和节次：
-{raw_text[:8000]}
+{text[:8000]}
 """
     try:
         ai_course_data = _call_course_ai(prompt_course)
-        # 本地后置校验：过滤AI幻觉输出的非法星期、非法节次
         valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
         valid_sections = set(range(1,14))
         cleaned_data = []
@@ -302,11 +292,11 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
         ai_course_data = cleaned_data
 
         if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜OCR:qwen3.5‑ocr｜结构化&个性化:doubao2.1‑seed‑pro (仅管理员批量上传可见)"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑max‑latest；个性化模型：doubao2.1‑seed‑pro"):
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
         course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
-        return f"课表结构化解析失败:{str(e)[:60]}"
+        return f"课表识别失败:{str(e)[:60]}"
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
@@ -531,14 +521,14 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("链路：PDF→qwen3.5‑ocr(Response非对话接口)提取文本 → doubao2.1‑seed‑pro做结构化+个性化解析")
+        st.caption("链路：PDF→fitz提取文本→qwen‑max‑latest解析课表；doubao2.1‑seed‑pro解析个性化")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接"])
             tab6 = None
         with tab1:
-            st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号-课表.pdf）")
+            st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号‑课表.pdf）")
             up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
             if up_files and st.button("📂 第一步：缓存PDF二进制，解析姓名身份电话"):
                 with st.spinner("读取PDF文件..."):
@@ -547,7 +537,6 @@ if menu == "管理员后台":
                     for f in up_files:
                         b = f.read()
                         pdf_bytes_list.append(b)
-                        # 本地fitz读一页用于提取名字，不调用OCR，节省额度
                         doc_tmp = fitz.open(stream=b, filetype="pdf")
                         txt_tmp = doc_tmp[0].get_text()
                         doc_tmp.close()
@@ -584,7 +573,7 @@ if menu == "管理员后台":
                 edited_temp = st.data_editor(df_temp, use_container_width=True, column_config=temp_config, num_rows="dynamic", key="temp_editor")
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
-                    if st.button("🤖 第二步：AI综合识别（qwen3.5‑ocr OCR + 火山结构化解析）"):
+                    if st.button("🤖 第二步：AI综合识别（课表+个性化需求）"):
                         current_rows = edited_temp.to_dict("records")
                         need_ai_idx = []
                         need_pdf_bin = []
@@ -595,7 +584,7 @@ if menu == "管理员后台":
                                 need_pdf_bin.append(st.session_state.temp_pdf_bytes[i] if i < len(st.session_state.temp_pdf_bytes) else b"")
                                 need_ai_personal.append(safe_str(row.get("personal_need")))
                         if need_pdf_bin:
-                            with st.spinner(f"OCR+AI处理 {len(need_pdf_bin)} 份课表，消耗qwen3.5‑ocr额度..."):
+                            with st.spinner(f"AI处理 {len(need_pdf_bin)} 份课表..."):
                                 bar = st.progress(0)
                                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                                     futures = {executor.submit(fast_ai_extract, pdf_bin, p): idx for idx, pdf_bin, p in zip(need_ai_idx, need_pdf_bin, need_ai_personal)}
@@ -615,7 +604,7 @@ if menu == "管理员后台":
                                 row["phone"] = safe_str(row.get("phone"))
                                 row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
                             st.session_state.temp_new_member = current_rows
-                            st.success("OCR+AI识别完成，请点开DEBUG面板核对原始课表JSON，防止AI幻觉脑补课程")
+                            st.success("AI识别完成，请点开DEBUG面板核对原始课表JSON，防止AI幻觉脑补课程")
                             st.rerun()
                         else:
                             st.info("所有人都已识别，不需要AI！")
@@ -815,7 +804,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("链路：PDF→qwen3.5‑ocr(Response非对话接口)提取文本 → doubao2.1‑seed‑pro做结构化+个性化解析")
+    st.caption("链路：PDF→fitz提取文本→qwen‑max‑latest解析课表；doubao2.1‑seed‑pro解析个性化")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
@@ -827,7 +816,7 @@ elif menu == "成员自助上传":
             if not (name and phone and pdf_file):
                 st.warning("姓名、电话、课表都需要填！")
             else:
-                with st.spinner("qwen3.5‑ocr识别PDF+AI解析课表，请稍候，消耗OCR额度..."):
+                with st.spinner("AI分析课表，请稍候..."):
                     pdf_bin = pdf_file.read()
                     class_conflict = fast_ai_extract(pdf_bin, limit_input)
                     personal_need = safe_str(limit_input)
@@ -843,4 +832,4 @@ elif menu == "成员自助上传":
                     if not exist:
                         all_mem.append({"name":name,"phone":phone,"role":role_sel,"class_conflict":class_conflict,"personal_need":personal_need})
                     save_members(all_mem)
-                st.success("提交成功！OCR+AI已综合识别你所有不能值班的时段。")
+                st.success("提交成功！AI已综合识别你所有不能值班的时段。")
