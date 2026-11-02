@@ -184,7 +184,7 @@ def _make_http_session():
 # =========【修复！千问 qwen‑max 使用 dashscope Generation.call，输入文本，不再传PDF二进制】 =========
 def _call_course_ai(prompt_text:str):
     resp = Generation.call(
-        model="qwen-max-latest",
+        model="qwen-plus",
         messages=[
             {"role":"system","content":EXTRACT_SYS_PROMPT},
             {"role":"user","content":prompt_text}
@@ -202,6 +202,7 @@ def _call_course_ai(prompt_text:str):
     if not match:
         raise ValueError("千问：没有返回合法JSON数组")
     return json.loads(match.group(0))
+
 
 # ========= 火山方舟doubao，关闭深度思考，防止脑补 =========
 def _call_personal_ai(prompt_text:str):
