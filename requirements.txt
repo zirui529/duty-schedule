@@ -1,11 +1,9 @@
 streamlit
-pandas
-numpy
 pymupdf
-openpyxl
+pandas
+dashscope
 reportlab
 requests
-Pillow
-python-dateutil
-dashscope
+urllib3
 pdfplumber
+pillow
