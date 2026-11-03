@@ -23,7 +23,7 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 # -------- 分工 --------
-# qwen-max dashscope Generation.call(文本)：fitz提取PDF文本之后做课表JSON解析
+# qwen‑plus dashscope Generation.call(文本)：fitz提取PDF文本之后做课表JSON解析
 # doubao2.1‑seed‑pro 火山chat：个性化需求解析
 try:
     ARK_API_KEY = st.secrets["ark"]["api_key"]
@@ -113,7 +113,7 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取：只用fitz，过滤打印时间、学号等干扰文本；识别扫描图片PDF ==========
+# ========== 【方案1：仅fitz提取，彻底移除pdfplumber网格逻辑】 ==========
 def get_pdf_full_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     clean_lines = []
@@ -124,16 +124,12 @@ def get_pdf_full_text(pdf_bytes):
             l = ln.strip()
             if not l:
                 continue
-            # 过滤无关噪声
-            if re.search(r"打印时间|学号|姓名|第.*页|页码|武汉大学.*课表", l):
+            # 过滤页脚打印、学号页码等干扰信息
+            if re.search(r"打印时间|学号|第.*页|页码", l):
                 continue
             clean_lines.append(l)
     doc.close()
-    output_text = "\n".join(clean_lines)
-    # 判断扫描图片PDF：提取得到文字过少
-    if len(output_text.replace("\n","").strip()) < 120:
-        return "【SCAN_PDF】扫描图片课表，无法文本识别，请手动填写冲突时段"
-    return output_text
+    return "\n".join(clean_lines)
 
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
@@ -158,7 +154,7 @@ def parse_filename_phone_and_role(filename):
 # ====================== AI提示词【抗幻觉】 ======================
 EXTRACT_SYS_PROMPT = """
 你是严谨课表提取工具。
-⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。空白单元格代表无课，不能当做有课！**
+⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
 1.星期只能：周一、周二、周三、周四、周五、周六、周日，不许简写。
 2.节次只允许1‑13的整数，其余全部丢弃。
 3.输出字段仅允许week、sections，不能增加任何别的key。
@@ -188,12 +184,7 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-# =========【千问调用，增加幻觉拦截：七天全部识别有课直接返回空数组】 =========
 def _call_course_ai(prompt_text:str):
-    # 扫描PDF标记直接抛出
-    if prompt_text.startswith("【SCAN_PDF】"):
-        raise ValueError(prompt_text)
-
     resp = Generation.call(
         model="qwen-plus",
         messages=[
@@ -212,29 +203,8 @@ def _call_course_ai(prompt_text:str):
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
         raise ValueError("千问：没有返回合法JSON数组")
-    raw_data = json.loads(match.group(0))
+    return json.loads(match.group(0))
 
-    valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
-    valid_sections = set(range(1,14))
-    cleaned_data = []
-    used_weeks = set()
-    for entry in raw_data:
-        if not isinstance(entry,dict):
-            continue
-        w = entry.get("week","")
-        sec_list = entry.get("sections",[])
-        if w not in valid_weeks:
-            continue
-        clean_sec = [x for x in sec_list if isinstance(x,int) and x in valid_sections]
-        if len(clean_sec)>0:
-            cleaned_data.append({"week":w,"sections":clean_sec})
-            used_weeks.add(w)
-    # 幻觉强拦截：七天全部识别有课，直接返回空数组，避免“满课”bug
-    if len(used_weeks) >=7:
-        return []
-    return cleaned_data
-
-# ========= 火山方舟doubao，关闭深度思考，防止脑补 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
@@ -322,7 +292,7 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
                 cleaned_data.append({"week":w,"sections":clean_sec})
         ai_course_data = cleaned_data
         if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑max‑latest；个性化模型：doubao2.1‑seed‑pro"):
+            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑plus；个性化模型：doubao2.1‑seed‑pro"):
                 st.text("=====传给AI的原始PDF文本====")
                 st.code(text[:3000])
                 st.text("=====AI输出解析结果====")
@@ -552,7 +522,7 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("链路：PDF→fitz提取文本→qwen‑max‑latest解析课表；doubao2.1‑seed‑pro解析个性化")
+        st.caption("链路：PDF→fitz提取文本→qwen‑plus解析课表；doubao2.1‑seed‑pro解析个性化")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -835,7 +805,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("链路：PDF→fitz提取文本→qwen‑max‑latest解析课表；doubao2.1‑seed‑pro解析个性化")
+    st.caption("链路：PDF→fitz提取文本→qwen‑plus解析课表；doubao2.1‑seed‑pro解析个性化")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
