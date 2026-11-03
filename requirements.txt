@@ -4,5 +4,4 @@ dashscope
 requests
 pandas
 reportlab
-pdfplumber
-numpy
+
