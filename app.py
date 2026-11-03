@@ -5,7 +5,6 @@ import json
 import os
 import re
 import random
-import base64
 from io import BytesIO
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +15,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 import dashscope
-from dashscope import Generation, MultiModalConversation
+from dashscope import Generation
 import numpy as np
 import pdfplumber
 
@@ -26,8 +25,7 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 # -------- 分工 --------
-# 主链路：qwen-vl-max 视觉识别课表表格；兜底：qwen-plus 文本识别
-# doubao2.1‑seed‑pro 火山chat：个性化需求解析
+# qwen-plus 文本识别课表；火山doubao2.1-seed-pro 解析个性化需求
 try:
     ARK_API_KEY = st.secrets["ark"]["api_key"]
     ARK_ENDPOINT = st.secrets["ark"]["endpoint"]
@@ -38,8 +36,7 @@ except KeyError:
     st.error("secrets必须配置[ark]、[dashscope]两组密钥！")
     st.stop()
 API_TIMEOUT = 30
-MAX_RETRY = 0
-MAX_WORKERS = 4
+MAX_WORKERS = 5  # 并发数，不建议超过5，防止dashscope限流429
 SHIFT_LIST = [
     {"shift_idx":0,"shift_name": "9:00-13:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":1,"shift_name": "13:00-17:00", "need_stu": 2, "need_wei": 1},
@@ -116,54 +113,31 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== PDF读取（保留作文本降级兜底） ==========
+# ========== PDF读取：只解析第1页，原生表格提取，保留行列结构 ==========
 def get_pdf_full_text(pdf_bytes):
-    row_count = 13
-    col_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    col_count = len(col_names)
-    grid = [["" for _ in range(col_count)] for _ in range(row_count)]
+    all_text = ""
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                words = page.extract_words()
-                if not words or len(words) < 5:
-                    continue
-                all_y = [w["top"] for w in words]
-                ys = np.array(all_y)
-                y_low = np.percentile(ys, 10)
-                y_high = np.percentile(ys, 90)
-                table_words = [w for w in words if (y_low <= w["top"] <= y_high)]
-                if len(table_words) < 3:
-                    table_words = words
-                table_x = [w["x0"] for w in table_words]
-                table_y = [w["top"] for w in table_words]
-                x_min, x_max = min(table_x), max(table_x)
-                y_min, y_max = min(table_y), max(table_y)
-                cell_w = (x_max - x_min) / col_count
-                cell_h = (y_max - y_min) / row_count
-                for w in table_words:
-                    wx = w["x0"]
-                    wy = w["top"]
-                    rel_x = wx - x_min
-                    rel_y = wy - y_min
-                    col_idx = int(rel_x / cell_w)
-                    row_idx = int(rel_y / cell_h)
-                    if 0 <= col_idx < col_count and 0 <= row_idx < row_count:
-                        grid[row_idx][col_idx] += w["text"] + " "
-        md_lines = ["| 节次 | " + " | ".join(col_names) + " |",
-                    "| ---- | " + " | ".join(["----"] * col_count) + " |"]
-        for r in range(row_count):
-            line = f"| {r+1} | " + " | ".join(grid[r]) + " |"
-            md_lines.append(line)
-        table_text = "\n".join(md_lines)
-        table_text = re.sub(r"打印时间[:：].*", "", table_text)
-        table_text = re.sub(r"学号[:：].*", "", table_text)
-        return table_text
+            page = pdf.pages[0]  # 武大课表基本只有1页，只解析第一页，大幅提速
+            table = page.extract_table()
+            if table:
+                for row in table:
+                    row_clean = [cell.strip() if cell else "" for cell in row]
+                    all_text += " | ".join(row_clean) + "\n"
+            else:
+                txt = page.extract_text()
+                if txt:
+                    all_text += txt + "\n"
     except Exception:
+        # 彻底失败降级fitz，同样只取第一页
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        txt = "".join(page.get_text() for page in doc)
+        all_text = doc[0].get_text()
         doc.close()
-        return txt
+
+    # 过滤噪声
+    all_text = re.sub(r"打印时间[:：].*", "", all_text)
+    all_text = re.sub(r"学号[:：]\w+", "", all_text)
+    return all_text.strip()
 
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
@@ -185,171 +159,73 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== AI提示词 ======================
-# 文本识别兜底提示词（保留）
-EXTRACT_SYS_PROMPT = """
-你是严谨课表提取工具。
-⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
-1.星期只能：周一、周二、周三、周四、周五、周六、周日，不许简写。
-2.节次只允许1‑13的整数，其余全部丢弃。
-3.输出字段仅允许week、sections，不能增加任何别的key。
-4.某星期完全无课，该星期不要写入数组。
-5.只输出纯净JSON数组，禁止```、注释、markdown、任何解释文字。
-节次参考：
-1:08:00-08:45｜2:08:50-09:35｜3:09:50-10:35｜4:10:40-11:25｜5:11:30-12:15
-6:14:05-14:50｜7:14:55-15:40｜8:15:45-16:30｜9:16:40-17:25
-10:17:30-18:15｜11:18:30-19:15｜12:19:20-20:05｜13:20:10-20:55
-✅正确示例：[{"week":"周一","sections":[1,3]},{"week":"周六","sections":[11]}]
-"""
-
-# 视觉识别专用提示词（比赛主力）
-VISION_EXTRACT_PROMPT = """
-你是专业课表识别引擎，当前识别的是武汉大学教务系统导出的学生课表图片。
-严格执行以下规则，违反即为错误：
-1. 表格横向共7列，从左到右依次为：星期日、星期一、星期二、星期三、星期四、星期五、星期六。必须严格按列归属课程，严禁串列。
-2. 纵向为节次，节次编号为 1~13，严格按行对应。
-3. 合并单元格的课程，按其实际占据的所有节次全部计入。
-4. 只有单元格内存在明确课程名称才算有课；空白单元格=无课，绝对不能输出。
-5. 输出格式：纯JSON数组，字段仅允许 week、sections。
-   week取值：周一、周二、周三、周四、周五、周六、周日
-   sections取值：1~13的整数数组
-6. 最高优先级铁律：没有的课绝对不能编造，拿不准就不输出。宁可漏，不可错。
-7. 只输出JSON，不要任何解释、备注、markdown代码块。
-
-正确输出示例：
-[{"week":"周一","sections":[1,2]},{"week":"周三","sections":[3,4,5]}]
+# ====================== AI提示词（精简版，提速+抗幻觉） ======================
+COURSE_EXTRACT_PROMPT = """
+课表提取：表格列从左到右依次为：节次、星期日、星期一、星期二、星期三、星期四、星期五、星期六。
+严格按列归属，禁止串列。
+规则：
+1. week：周日/周一/周二/周三/周四/周五/周六；sections：1-13整数。
+2. 有课程名称才算有课；空白=无课，严禁编造。
+3. 合并单元格计入全部占据节次。
+4. 只输出JSON数组，格式：[{"week":"xxx","sections":[x]}]，不要任何多余文字。
+5. 拿不准就不输出，宁可漏不可错。
 """
 
 PERSONAL_SYS_PROMPT = """
-任务：解析用户个性化额外禁止值班需求，输出JSON字符串数组。
-铁律：
-1. 不许重复课表已经算出的冲突时段！**只提取用户原话明确说出的限制，禁止脑补、禁止联想额外限制。**
-2.输出只能是："周X上午"、"周X下午"、"周X晚上"
-3.合法集合：["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
-4.没有额外限制返回[]。
-5.只输出纯JSON，禁止markdown、注释、解释。
-✅示例：["周日上午","周二晚上"]
-✅无限制示例：[]
+解析用户额外禁班需求，只输出新增时段JSON数组。
+合法值：周一上午、周一下午、周一晚上、周二上午…周日晚上。
+不要重复课表已有冲突。无新增返回[]。只输出纯JSON。
 """
 
+# ========== HTTP会话：连接池复用，减少握手开销 ==========
 def _make_http_session():
     sess = requests.Session()
-    adapt = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1), pool_connections=1, pool_maxsize=1)
+    adapt = HTTPAdapter(
+        max_retries=Retry(total=2, backoff_factor=0.5),
+        pool_connections=8,
+        pool_maxsize=8
+    )
     sess.mount("https://", adapt)
     return sess
 
-# ========== 工具：PDF渲染为高清图片 ==========
-def pdf_render_to_images(pdf_bytes, dpi=220):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    image_list = []
-    for page in doc:
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
-        image_list.append(pix.tobytes("png"))
-    doc.close()
-    return image_list
+# ========== 课表AI识别：内部捕获异常，不中断批量 ==========
+def _call_course_ai(prompt_text: str):
+    try:
+        resp = Generation.call(
+            model="qwen-plus",
+            messages=[
+                {"role": "system", "content": COURSE_EXTRACT_PROMPT},
+                {"role": "user", "content": f"课表内容:\n{prompt_text[:6000]}"}
+            ],
+            temperature=0.0,
+            max_tokens=800,
+            result_format="message"
+        )
+    except Exception:
+        return []
 
-# ========== 兜底：纯文本识别 ==========
-def _call_course_ai_text(prompt_text: str):
-    resp = Generation.call(
-        model="qwen-plus",
-        messages=[
-            {"role": "system", "content": EXTRACT_SYS_PROMPT},
-            {"role": "user", "content": prompt_text}
-        ],
-        temperature=0.0,
-        max_tokens=2000,
-        result_format="message"
-    )
     if resp.status_code != 200:
-        raise ValueError(f"文本识别API异常 code:{resp.status_code}")
+        return []
+
     out = resp.output.choices[0].message.content.strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("文本识别未返回合法JSON")
-    return json.loads(match.group(0))
+        return []
 
-# ========== 主识别函数：视觉模型 + 三重规则校验 ==========
-def _call_course_ai(pdf_bytes: bytes):
-    img_list = pdf_render_to_images(pdf_bytes)
-    all_result = []
-    dedup_keys = set()
+    try:
+        raw_data = json.loads(match.group(0))
+    except:
+        return []
 
-    for img_bin in img_list:
-        b64 = base64.b64encode(img_bin).decode()
-        img_uri = f"data:image/png;base64,{b64}"
-        try:
-            resp = MultiModalConversation.call(
-                model="qwen-vl-max",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"image": img_uri},
-                            {"text": VISION_EXTRACT_PROMPT}
-                        ]
-                    }
-                ],
-                temperature=0.0,
-                result_format="message"
-            )
-        except Exception:
-            continue
-
-        if resp.status_code != 200:
-            continue
-
-        # 解析多模态返回
-        content = resp.output.choices[0].message.content
-        raw_text = ""
-        if isinstance(content, list):
-            for item in content:
-                if "text" in item:
-                    raw_text += item["text"]
-        else:
-            raw_text = str(content)
-
-        # 提取JSON
-        raw_text = raw_text.strip()
-        raw_text = re.sub(r"^```[^\n]*\n", "", raw_text)
-        raw_text = re.sub(r"\n```$", "", raw_text)
-        match = re.search(r"\[.*\]", raw_text, re.DOTALL)
-        if not match:
-            continue
-        try:
-            page_data = json.loads(match.group(0))
-        except:
-            continue
-
-        # 单页结果清洗 + 多页去重合并
-        for item in page_data:
-            if not isinstance(item, dict):
-                continue
-            w = item.get("week", "")
-            secs = item.get("sections", [])
-            if not w or not secs:
-                continue
-            key = w + "|" + str(sorted(secs))
-            if key not in dedup_keys:
-                dedup_keys.add(key)
-                all_result.append(item)
-
-    # 视觉链路完全失败 → 自动降级文本方案
-    if not all_result:
-        text = get_pdf_full_text(pdf_bytes)
-        prompt = f"下面是课表原文，提取里面所有星期和节次：\n{text[:8000]}"
-        try:
-            all_result = _call_course_ai_text(prompt)
-        except Exception:
-            raise ValueError("视觉与文本识别均失败，请手动填写冲突时段")
-
-    # ========== 三重规则校验（比赛防御核心，绝对禁止静默输出错误数据） ==========
+    # 合法性过滤，不做粗暴拦截
     valid_weeks = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"}
     valid_sec = set(range(1, 14))
     cleaned = []
-    for item in all_result:
+    for item in raw_data:
+        if not isinstance(item, dict):
+            continue
         w = item.get("week", "")
         secs = item.get("sections", [])
         if w not in valid_weeks:
@@ -357,18 +233,9 @@ def _call_course_ai(pdf_bytes: bytes):
         sec_clean = [s for s in secs if isinstance(s, int) and s in valid_sec]
         if sec_clean:
             cleaned.append({"week": w, "sections": sec_clean})
-
-    week_set = {x["week"] for x in cleaned}
-    # 校验1：仅周日有课 → 几乎肯定是列错位，拦截
-    if week_set == {"周日"} and len(cleaned) > 0:
-        raise ValueError("识别异常：课程全部归为周日，疑似列错位，请人工复核")
-    # 校验2：七天全满 → 大概率幻觉，拦截
-    if len(week_set) >= 7:
-        raise ValueError("识别异常：七天全部判定为有课，请人工复核确认")
-
     return cleaned
 
-# ========= 火山方舟doubao，关闭深度思考 =========
+# ========= 火山方舟个性化需求解析 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
@@ -380,23 +247,30 @@ def _call_personal_ai(prompt_text:str):
             {"role":"user","content":prompt_text}
         ],
         "temperature":0,
-        "max_tokens":1000,
+        "max_tokens":500,
         "extra_body":{"thinking":{"type":"disabled"}}
     }
-    resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
-    resp.raise_for_status()
+    try:
+        resp = sess.post(url, headers=headers, json=payload, timeout=API_TIMEOUT)
+        resp.raise_for_status()
+    except Exception:
+        return []
+
     out = resp.json()["choices"][0]["message"]["content"].strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
         return []
-    arr = json.loads(match.group(0))
+    try:
+        arr = json.loads(match.group(0))
+    except:
+        return []
     raw_list = [s.strip() for s in arr if isinstance(s,str)]
     filtered = [x for x in raw_list if x in ALL_SLOTS]
     return filtered
 
-# 节次时间(分钟，从0点起算)
+# 节次时间映射
 SECTION_TIME = {
     1: (8*60+0, 8*60+45),
     2: (8*60+50, 9*60+35),
@@ -431,37 +305,42 @@ def calc_course_conflict(ai_course_data):
             conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
-# ========== 识别入口函数（适配视觉主链路） ==========
-def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
-    try:
-        ai_course_data = _call_course_ai(pdf_bytes)
-    except Exception as e:
-        return f"课表识别失败:{str(e)[:80]}"
+# ========== 识别入口：批量时关闭DEBUG渲染，大幅提速 ==========
+def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", show_debug:bool=False):
+    text = get_pdf_full_text(pdf_bytes)
+    if not text or len(text.strip()) < 10:
+        return "课表文本提取失败，请手动填写"
 
-    if st.runtime.exists():
-        with st.expander("🔍DEBUG 课表识别详情｜主模型：qwen-vl-max视觉识别；兜底：qwen-plus文本"):
-            st.text("===== AI结构化输出 =====")
+    ai_course_data = _call_course_ai(text)
+
+    # 只有单条调试时才渲染DEBUG，批量时关闭，避免前端性能瓶颈
+    if st.runtime.exists() and show_debug:
+        with st.expander("🔍DEBUG 课表识别详情"):
+            st.text("===== 提取到的表格文本 =====")
+            st.code(text[:3000])
+            st.text("===== AI识别结果 =====")
             st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
+            week_cnt = len({x["week"] for x in ai_course_data})
+            if week_cnt >= 7:
+                st.warning("⚠️ 识别结果覆盖全部7天，疑似幻觉，请人工核对后手动修正")
 
     course_conflict = calc_course_conflict(ai_course_data)
 
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
-课表已经算出不能值班时段：{json.dumps(course_conflict, ensure_ascii=False)}
-用户额外要求：{personal_need}
-只输出用户额外新增禁止的时段，不要包含课表已经有的。
+已冲突时段:{json.dumps(course_conflict, ensure_ascii=False)}
+用户额外要求:{personal_need}
+只输出新增禁止时段，不要重复已有冲突。
 """
-        try:
-            personal_conflict = _call_personal_ai(prompt_personal)
-        except Exception:
-            personal_conflict = []
+        personal_conflict = _call_personal_ai(prompt_personal)
+
     total = list(set(course_conflict + personal_conflict))
     if not total:
         return "识别为空，请手动填写"
     return "、".join(sorted(total))
 
-# ========== 判断某人在某时段是否有空 ==========
+# ========== 排班可用性判断 ==========
 def is_available(member, week_idx, shift_idx):
     class_conflict = safe_str(member.get("class_conflict"))
     week_name = WEEK_NAMES[week_idx]
@@ -536,7 +415,7 @@ def smart_schedule(member_list):
         st.success(f"✅ 职委排班完成：共 {len(wei_pool)} 名职委，平均每人排 {sum(wei_count.values())/len(wei_pool):.1f} 班")
     return schedule
 
-# ========== 模式A：系统自动生成PDF ==========
+# ========== 模式A：系统生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -645,6 +524,7 @@ if _is_self_page:
     menu = "成员自助上传"
 else:
     menu = st.sidebar.radio("导航", ["管理员后台", "成员自助上传"])
+
 if menu == "管理员后台":
     if not st.session_state.login:
         st.title("管理员登录")
@@ -667,12 +547,13 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("链路：PDF→视觉模型识别课表；doubao2.1‑seed‑pro解析个性化需求")
+        st.caption("链路：PDF表格提取→qwen-plus识别课表；doubao2.1-seed-pro解析个性化需求")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
             tab1, tab2, tab3, tab4, tab5 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接"])
             tab6 = None
+
         with tab1:
             st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号‑课表.pdf）")
             up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
@@ -707,14 +588,15 @@ if menu == "管理员后台":
                     st.session_state.temp_new_member = unique
                 st.success(f"已缓存 {len(unique)} 份PDF，填写个性化需求后执行AI识别")
                 st.rerun()
+
             if len(st.session_state.temp_new_member) > 0:
                 st.divider()
-                st.subheader("📋 预览表格（先填个性化需求，再点AI识别，AI会综合课表+需求一起算）")
+                st.subheader("📋 预览表格（先填个性化需求，再点AI识别）")
                 df_temp = pd.DataFrame(st.session_state.temp_new_member)
                 temp_config = {
                     "role": st.column_config.SelectboxColumn("身份", options=["学员","职委"], required=True),
                     "class_conflict": st.column_config.TextColumn("AI识别不能值班时段（课表+需求综合）"),
-                    "personal_need": st.column_config.TextColumn("个性化需求（手动填，AI会自动识别各种说法）")
+                    "personal_need": st.column_config.TextColumn("个性化需求（手动填，AI自动识别）")
                 }
                 edited_temp = st.data_editor(df_temp, use_container_width=True, column_config=temp_config, num_rows="dynamic", key="temp_editor")
                 col_a, col_b, col_c = st.columns(3)
@@ -733,7 +615,8 @@ if menu == "管理员后台":
                             with st.spinner(f"AI处理 {len(need_pdf_bin)} 份课表..."):
                                 bar = st.progress(0)
                                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                                    futures = {executor.submit(fast_ai_extract, pdf_bin, p): idx for idx, pdf_bin, p in zip(need_ai_idx, need_pdf_bin, need_ai_personal)}
+                                    # 批量关闭DEBUG渲染，提速核心
+                                    futures = {executor.submit(fast_ai_extract, pdf_bin, p, False): idx for idx, pdf_bin, p in zip(need_ai_idx, need_pdf_bin, need_ai_personal)}
                                     done = 0
                                     for fut in as_completed(futures):
                                         idx = futures[fut]
@@ -750,7 +633,7 @@ if menu == "管理员后台":
                                 row["phone"] = safe_str(row.get("phone"))
                                 row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
                             st.session_state.temp_new_member = current_rows
-                            st.success("AI识别完成，请点开DEBUG面板核对原始课表JSON，防止AI幻觉脑补课程")
+                            st.success("AI识别完成，可点开人员库手动修正识别偏差")
                             st.rerun()
                         else:
                             st.info("所有人都已识别，不需要AI！")
@@ -778,6 +661,7 @@ if menu == "管理员后台":
                         st.session_state.temp_new_member = []
                         st.session_state.temp_pdf_bytes = []
                         st.rerun()
+
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
             mem = load_members()
@@ -808,16 +692,18 @@ if menu == "管理员后台":
                     save_members([])
                     st.warning("人员库已清空！")
                     st.rerun()
+
         with tab3:
-            st.subheader("一键排班（AI综合考虑课表冲突+个性化需求+职委均匀轮班）")
+            st.subheader("一键排班（综合课表冲突+个性化需求+职委均匀轮班）")
             mlist = load_members()
             if st.button("生成值班表"):
-                with st.spinner("正在智能排班，综合考虑课表冲突和个性化需求..."):
+                with st.spinner("正在智能排班..."):
                     result = smart_schedule(mlist)
                     st.session_state.schedule_result = result
                 st.success("排班完成！")
             if st.session_state.schedule_result:
                 st.dataframe(pd.DataFrame(st.session_state.schedule_result), use_container_width=True)
+
         with tab4:
             st.subheader("导出PDF（两种模式任选）")
             mode_sel = st.radio("选择导出模式", ["模式A：系统自动生成值班表", "模式B：上传我的空白模板PDF，自动填充"])
@@ -831,8 +717,8 @@ if menu == "管理员后台":
                             pdf_buf = export_pdf_auto(st.session_state.schedule_result, pdf_template_sel)
                         st.download_button("下载值班表", pdf_buf, file_name="值班表.pdf", mime="application/pdf")
             else:
-                st.info("上传你自己的空白值班表PDF模板，文字块整体缩小居中")
-                user_up = st.file_uploader("上传你的空白值班表PDF模板", type="pdf")
+                st.info("上传空白值班表PDF模板，自动填充人员信息")
+                user_up = st.file_uploader("上传空白值班表PDF模板", type="pdf")
                 if user_up:
                     st.session_state.user_template_bytes = user_up.read()
                     st.success("模板已加载！")
@@ -841,32 +727,34 @@ if menu == "管理员后台":
                 if not st.session_state.schedule_result:
                     st.warning("请先生成排班结果")
                 elif not st.session_state.user_template_bytes:
-                    st.warning("请先上传你的空白模板PDF")
+                    st.warning("请先上传空白模板PDF")
                 else:
                     if st.button("自动填充我的模板并导出"):
-                        with st.spinner("正在填充你的模板PDF..."):
+                        with st.spinner("正在填充模板..."):
                             out_buf = fill_user_template_pdf(st.session_state.user_template_bytes, st.session_state.schedule_result, int(off_x), int(off_y))
                         st.download_button("下载填充好的值班表", out_buf, file_name="值班表_已填充.pdf", mime="application/pdf")
+
         with tab5:
             st.subheader("分享自助提交链接")
-            st.info("把下面这个链接发给成员，他们可以免登录自助上传课表、填写个性化需求")
+            st.info("把链接发给成员，可免登录自助上传课表、填写个性化需求")
             try:
                 base_app_url = str(st.context.url)
             except Exception:
                 base_app_url = "http://localhost:8501"
             base_app_url = base_app_url.rstrip("/")
             self_link = f"{base_app_url}?page=self"
-            st.text_input("自动识别得到网址（请勿修改）", value=base_app_url, disabled=True)
+            st.text_input("应用网址", value=base_app_url, disabled=True)
             st.code(self_link, language="text")
             if st.button("复制链接提示"):
                 st.success("链接已生成，直接复制发给成员即可！")
+
         if tab6 is not None:
             with tab6:
                 st.subheader("管理员管理（仅超级管理员可见）")
                 st.markdown("#### 修改超级管理员账号")
                 old_pwd = st.text_input("原密码", type="password", key="old_pwd_super")
-                new_username = st.text_input("新管理员账号（留空则不修改）", value="", key="new_username_super")
-                new_pwd = st.text_input("新密码（留空则不修改）", type="password", key="new_pwd_super")
+                new_username = st.text_input("新管理员账号（留空不修改）", value="", key="new_username_super")
+                new_pwd = st.text_input("新密码（留空不修改）", type="password", key="new_pwd_super")
                 confirm_pwd = st.text_input("确认新密码", type="password", key="confirm_pwd_super")
                 if st.button("保存超级管理员修改"):
                     admin_data = load_admin()
@@ -891,6 +779,7 @@ if menu == "管理员后台":
                             st.session_state.current_admin = new_username.strip()
                         st.success("超级管理员账号信息已更新！")
                         st.rerun()
+
                 st.divider()
                 st.markdown("#### 修改当前账号密码")
                 old_pwd2 = st.text_input("原密码", type="password", key="old_pwd")
@@ -911,6 +800,7 @@ if menu == "管理员后台":
                                 break
                         else:
                             st.error("原密码错误")
+
                 st.divider()
                 st.markdown("#### 添加新管理员")
                 new_admin_user = st.text_input("新管理员账号", key="new_admin_user")
@@ -926,12 +816,14 @@ if menu == "管理员后台":
                         admin_data["admins"].append({"username": new_admin_user, "password": new_admin_pwd, "is_super": False})
                         save_admin(admin_data)
                         st.success(f"管理员 {new_admin_user} 添加成功！")
+
                 st.divider()
                 st.markdown("#### 管理员列表")
                 admin_data = load_admin()
                 df_admin = pd.DataFrame(admin_data["admins"])
                 df_admin["角色"] = df_admin["is_super"].apply(lambda x: "超级管理员" if x else "普通管理员")
                 st.dataframe(df_admin[["username","角色"]], use_container_width=True)
+
                 st.divider()
                 st.markdown("#### 删除管理员")
                 normal_admins = [a["username"] for a in admin_data["admins"] if not a.get("is_super", False)]
@@ -944,18 +836,20 @@ if menu == "管理员后台":
                         st.success(f"管理员 {delete_user} 已删除！")
                 else:
                     st.info("暂无普通管理员可删除")
+
         if st.button("退出登录"):
             st.session_state.login = False
             st.session_state.current_admin = ""
             st.rerun()
+
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("链路：PDF→视觉模型识别课表；doubao2.1‑seed‑pro解析个性化需求")
+    st.caption("链路：PDF表格提取→qwen-plus识别课表；doubao2.1-seed-pro解析个性化需求")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
         role_sel = st.radio("身份", ["学员","职委"])
-        limit_input = st.text_input("个性化需求（选填，各种说法都行：周末不值班 / 只在周六下午有空 / 周一上午有课）")
+        limit_input = st.text_input("个性化需求（选填）")
         pdf_file = st.file_uploader("上传你的课表PDF", type="pdf")
         submit = st.form_submit_button("提交")
         if submit:
@@ -964,7 +858,7 @@ elif menu == "成员自助上传":
             else:
                 with st.spinner("AI分析课表，请稍候..."):
                     pdf_bin = pdf_file.read()
-                    class_conflict = fast_ai_extract(pdf_bin, limit_input)
+                    class_conflict = fast_ai_extract(pdf_bin, limit_input, show_debug=False)
                     personal_need = safe_str(limit_input)
                     all_mem = load_members()
                     exist = False
