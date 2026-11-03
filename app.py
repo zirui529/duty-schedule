@@ -5,6 +5,7 @@ import json
 import os
 import re
 import random
+import base64
 from io import BytesIO
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +16,9 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 import dashscope
-from dashscope import Generation
+from dashscope import Generation, MultiModalConversation
+import numpy as np
+import pdfplumber
 
 # ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
@@ -23,7 +26,7 @@ DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
 # -------- 分工 --------
-# qwen‑plus dashscope Generation.call(文本)：fitz提取PDF文本之后做课表JSON解析
+# 主链路：qwen-vl-max 视觉识别课表表格；兜底：qwen-plus 文本识别
 # doubao2.1‑seed‑pro 火山chat：个性化需求解析
 try:
     ARK_API_KEY = st.secrets["ark"]["api_key"]
@@ -113,23 +116,54 @@ def load_members():
 def save_members(data):
     json.dump(data, open(DATA_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-# ========== 【方案1：仅fitz提取，彻底移除pdfplumber网格逻辑】 ==========
+# ========== PDF读取（保留作文本降级兜底） ==========
 def get_pdf_full_text(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    clean_lines = []
-    for page in doc:
-        raw = page.get_text()
-        lines = raw.splitlines()
-        for ln in lines:
-            l = ln.strip()
-            if not l:
-                continue
-            # 过滤页脚打印、学号页码等干扰信息
-            if re.search(r"打印时间|学号|第.*页|页码", l):
-                continue
-            clean_lines.append(l)
-    doc.close()
-    return "\n".join(clean_lines)
+    row_count = 13
+    col_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    col_count = len(col_names)
+    grid = [["" for _ in range(col_count)] for _ in range(row_count)]
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words or len(words) < 5:
+                    continue
+                all_y = [w["top"] for w in words]
+                ys = np.array(all_y)
+                y_low = np.percentile(ys, 10)
+                y_high = np.percentile(ys, 90)
+                table_words = [w for w in words if (y_low <= w["top"] <= y_high)]
+                if len(table_words) < 3:
+                    table_words = words
+                table_x = [w["x0"] for w in table_words]
+                table_y = [w["top"] for w in table_words]
+                x_min, x_max = min(table_x), max(table_x)
+                y_min, y_max = min(table_y), max(table_y)
+                cell_w = (x_max - x_min) / col_count
+                cell_h = (y_max - y_min) / row_count
+                for w in table_words:
+                    wx = w["x0"]
+                    wy = w["top"]
+                    rel_x = wx - x_min
+                    rel_y = wy - y_min
+                    col_idx = int(rel_x / cell_w)
+                    row_idx = int(rel_y / cell_h)
+                    if 0 <= col_idx < col_count and 0 <= row_idx < row_count:
+                        grid[row_idx][col_idx] += w["text"] + " "
+        md_lines = ["| 节次 | " + " | ".join(col_names) + " |",
+                    "| ---- | " + " | ".join(["----"] * col_count) + " |"]
+        for r in range(row_count):
+            line = f"| {r+1} | " + " | ".join(grid[r]) + " |"
+            md_lines.append(line)
+        table_text = "\n".join(md_lines)
+        table_text = re.sub(r"打印时间[:：].*", "", table_text)
+        table_text = re.sub(r"学号[:：].*", "", table_text)
+        return table_text
+    except Exception:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        txt = "".join(page.get_text() for page in doc)
+        doc.close()
+        return txt
 
 def extract_name_from_text(text):
     m = re.search(r"([\u4e00-\u9fa5]{2,4})课表", text)
@@ -151,7 +185,8 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== AI提示词【抗幻觉】 ======================
+# ====================== AI提示词 ======================
+# 文本识别兜底提示词（保留）
 EXTRACT_SYS_PROMPT = """
 你是严谨课表提取工具。
 ⚠️最高优先级铁律：**没有在提供的课表原文中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
@@ -166,6 +201,25 @@ EXTRACT_SYS_PROMPT = """
 10:17:30-18:15｜11:18:30-19:15｜12:19:20-20:05｜13:20:10-20:55
 ✅正确示例：[{"week":"周一","sections":[1,3]},{"week":"周六","sections":[11]}]
 """
+
+# 视觉识别专用提示词（比赛主力）
+VISION_EXTRACT_PROMPT = """
+你是专业课表识别引擎，当前识别的是武汉大学教务系统导出的学生课表图片。
+严格执行以下规则，违反即为错误：
+1. 表格横向共7列，从左到右依次为：星期日、星期一、星期二、星期三、星期四、星期五、星期六。必须严格按列归属课程，严禁串列。
+2. 纵向为节次，节次编号为 1~13，严格按行对应。
+3. 合并单元格的课程，按其实际占据的所有节次全部计入。
+4. 只有单元格内存在明确课程名称才算有课；空白单元格=无课，绝对不能输出。
+5. 输出格式：纯JSON数组，字段仅允许 week、sections。
+   week取值：周一、周二、周三、周四、周五、周六、周日
+   sections取值：1~13的整数数组
+6. 最高优先级铁律：没有的课绝对不能编造，拿不准就不输出。宁可漏，不可错。
+7. 只输出JSON，不要任何解释、备注、markdown代码块。
+
+正确输出示例：
+[{"week":"周一","sections":[1,2]},{"week":"周三","sections":[3,4,5]}]
+"""
+
 PERSONAL_SYS_PROMPT = """
 任务：解析用户个性化额外禁止值班需求，输出JSON字符串数组。
 铁律：
@@ -184,27 +238,137 @@ def _make_http_session():
     sess.mount("https://", adapt)
     return sess
 
-def _call_course_ai(prompt_text:str):
+# ========== 工具：PDF渲染为高清图片 ==========
+def pdf_render_to_images(pdf_bytes, dpi=220):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    image_list = []
+    for page in doc:
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat)
+        image_list.append(pix.tobytes("png"))
+    doc.close()
+    return image_list
+
+# ========== 兜底：纯文本识别 ==========
+def _call_course_ai_text(prompt_text: str):
     resp = Generation.call(
         model="qwen-plus",
         messages=[
-            {"role":"system","content":EXTRACT_SYS_PROMPT},
-            {"role":"user","content":prompt_text}
+            {"role": "system", "content": EXTRACT_SYS_PROMPT},
+            {"role": "user", "content": prompt_text}
         ],
         temperature=0.0,
         max_tokens=2000,
         result_format="message"
     )
     if resp.status_code != 200:
-        raise ValueError(f"千问API异常 code:{resp.status_code} {resp.message}")
+        raise ValueError(f"文本识别API异常 code:{resp.status_code}")
     out = resp.output.choices[0].message.content.strip()
     out = re.sub(r"^```[^\n]*\n", "", out)
     out = re.sub(r"\n```$", "", out)
     match = re.search(r"\[.*\]", out, re.DOTALL)
     if not match:
-        raise ValueError("千问：没有返回合法JSON数组")
+        raise ValueError("文本识别未返回合法JSON")
     return json.loads(match.group(0))
 
+# ========== 主识别函数：视觉模型 + 三重规则校验 ==========
+def _call_course_ai(pdf_bytes: bytes):
+    img_list = pdf_render_to_images(pdf_bytes)
+    all_result = []
+    dedup_keys = set()
+
+    for img_bin in img_list:
+        b64 = base64.b64encode(img_bin).decode()
+        img_uri = f"data:image/png;base64,{b64}"
+        try:
+            resp = MultiModalConversation.call(
+                model="qwen-vl-max",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"image": img_uri},
+                            {"text": VISION_EXTRACT_PROMPT}
+                        ]
+                    }
+                ],
+                temperature=0.0,
+                result_format="message"
+            )
+        except Exception:
+            continue
+
+        if resp.status_code != 200:
+            continue
+
+        # 解析多模态返回
+        content = resp.output.choices[0].message.content
+        raw_text = ""
+        if isinstance(content, list):
+            for item in content:
+                if "text" in item:
+                    raw_text += item["text"]
+        else:
+            raw_text = str(content)
+
+        # 提取JSON
+        raw_text = raw_text.strip()
+        raw_text = re.sub(r"^```[^\n]*\n", "", raw_text)
+        raw_text = re.sub(r"\n```$", "", raw_text)
+        match = re.search(r"\[.*\]", raw_text, re.DOTALL)
+        if not match:
+            continue
+        try:
+            page_data = json.loads(match.group(0))
+        except:
+            continue
+
+        # 单页结果清洗 + 多页去重合并
+        for item in page_data:
+            if not isinstance(item, dict):
+                continue
+            w = item.get("week", "")
+            secs = item.get("sections", [])
+            if not w or not secs:
+                continue
+            key = w + "|" + str(sorted(secs))
+            if key not in dedup_keys:
+                dedup_keys.add(key)
+                all_result.append(item)
+
+    # 视觉链路完全失败 → 自动降级文本方案
+    if not all_result:
+        text = get_pdf_full_text(pdf_bytes)
+        prompt = f"下面是课表原文，提取里面所有星期和节次：\n{text[:8000]}"
+        try:
+            all_result = _call_course_ai_text(prompt)
+        except Exception:
+            raise ValueError("视觉与文本识别均失败，请手动填写冲突时段")
+
+    # ========== 三重规则校验（比赛防御核心，绝对禁止静默输出错误数据） ==========
+    valid_weeks = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"}
+    valid_sec = set(range(1, 14))
+    cleaned = []
+    for item in all_result:
+        w = item.get("week", "")
+        secs = item.get("sections", [])
+        if w not in valid_weeks:
+            continue
+        sec_clean = [s for s in secs if isinstance(s, int) and s in valid_sec]
+        if sec_clean:
+            cleaned.append({"week": w, "sections": sec_clean})
+
+    week_set = {x["week"] for x in cleaned}
+    # 校验1：仅周日有课 → 几乎肯定是列错位，拦截
+    if week_set == {"周日"} and len(cleaned) > 0:
+        raise ValueError("识别异常：课程全部归为周日，疑似列错位，请人工复核")
+    # 校验2：七天全满 → 大概率幻觉，拦截
+    if len(week_set) >= 7:
+        raise ValueError("识别异常：七天全部判定为有课，请人工复核确认")
+
+    return cleaned
+
+# ========= 火山方舟doubao，关闭深度思考 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
@@ -267,39 +431,20 @@ def calc_course_conflict(ai_course_data):
             conflict.add(f"{w}{shift_name}")
     return sorted(list(conflict))
 
+# ========== 识别入口函数（适配视觉主链路） ==========
 def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
-    text = get_pdf_full_text(pdf_bytes)
-    if not text or len(text.strip()) < 10:
-        return "课表文本提取失败，请手动填写"
-    prompt_course = f"""
-下面是课表原文，提取里面所有星期和节次：
-{text[:8000]}
-"""
     try:
-        ai_course_data = _call_course_ai(prompt_course)
-        valid_weeks = {"周一","周二","周三","周四","周五","周六","周日"}
-        valid_sections = set(range(1,14))
-        cleaned_data = []
-        for entry in ai_course_data:
-            if not isinstance(entry,dict):
-                continue
-            w = entry.get("week","")
-            sec_list = entry.get("sections",[])
-            if w not in valid_weeks:
-                continue
-            clean_sec = [x for x in sec_list if isinstance(x,int) and x in valid_sections]
-            if len(clean_sec)>0:
-                cleaned_data.append({"week":w,"sections":clean_sec})
-        ai_course_data = cleaned_data
-        if st.runtime.exists():
-            with st.expander("🔍DEBUG AI读取原始课表｜课表模型：qwen‑plus；个性化模型：doubao2.1‑seed‑pro"):
-                st.text("=====传给AI的原始PDF文本====")
-                st.code(text[:3000])
-                st.text("=====AI输出解析结果====")
-                st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
-        course_conflict = calc_course_conflict(ai_course_data)
+        ai_course_data = _call_course_ai(pdf_bytes)
     except Exception as e:
-        return f"课表识别失败:{str(e)[:60]}"
+        return f"课表识别失败:{str(e)[:80]}"
+
+    if st.runtime.exists():
+        with st.expander("🔍DEBUG 课表识别详情｜主模型：qwen-vl-max视觉识别；兜底：qwen-plus文本"):
+            st.text("===== AI结构化输出 =====")
+            st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
+
+    course_conflict = calc_course_conflict(ai_course_data)
+
     personal_conflict = []
     if personal_need and personal_need.strip() not in ("","无"):
         prompt_personal = f"""
@@ -522,7 +667,7 @@ if menu == "管理员后台":
                 st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("链路：PDF→fitz提取文本→qwen‑plus解析课表；doubao2.1‑seed‑pro解析个性化")
+        st.caption("链路：PDF→视觉模型识别课表；doubao2.1‑seed‑pro解析个性化需求")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -805,7 +950,7 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("链路：PDF→fitz提取文本→qwen‑plus解析课表；doubao2.1‑seed‑pro解析个性化")
+    st.caption("链路：PDF→视觉模型识别课表；doubao2.1‑seed‑pro解析个性化需求")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
