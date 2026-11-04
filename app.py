@@ -63,6 +63,19 @@ def safe_str(val):
         return ""
     return str(val).strip()
 
+# ========== 识别结果失败判定 & 规范化（管理员上传 / 成员自助上传 两条路径共用） ==========
+FAIL_PREFIXES = ("课表识别失败", "识别为空", "课表文本提取失败")
+
+def is_recognize_failed(text):
+    t = safe_str(text)
+    return (not t) or t.startswith(FAIL_PREFIXES)
+
+def normalize_conflict_text(text):
+    """把「周二下午,周五晚上」等各种分隔符写法统一成「周二下午、周五晚上」，只保留合法时段。"""
+    tokens = re.split(r"[、,，;；/\s]+", safe_str(text))
+    valid = [t.strip() for t in tokens if t.strip() in ALL_SLOTS]
+    return "、".join(sorted(set(valid)))
+
 # ========== 管理员文件读写 ==========
 def init_admin():
     if not os.path.exists(ADMIN_FILE):
@@ -122,8 +135,20 @@ def save_members(data):
 
 # ========== PDF读取【三级降级：①表格线识别 ②表头锚点网格 ③纯文本】 ==========
 def _cell_text(v):
-    t = re.sub(r"[|\n]", " ", safe_str(v)).strip()
-    return t[:200]  # 单元格截断，防止元数据撑爆token
+    t = re.sub(r"[|\n\r]", " ", safe_str(v))
+    # 先去掉所有空白（源PDF里字段名常被换行拆开，如"教学班组 成"）
+    t = re.sub(r"\s+", "", t)
+    # 按"(X-Y节)"课程条目切分：一格里可能有多门课，逐条保留课名+节次+周次+场地+教师
+    ms = list(re.finditer(r"[^/]{1,40}\(\d+(?:-\d+)?节\)", t))
+    if not ms:
+        return t[:300]
+    entries = []
+    for i, m in enumerate(ms):
+        seg = t[m.start(): ms[i+1].start() if i + 1 < len(ms) else len(t)]
+        seg = re.split(r"/教学班", seg)[0]  # 每条记录在教学班号等元数据处截断
+        if seg:
+            entries.append(seg)
+    return "；".join(entries)[:400]
 
 def _norm_header(c):
     return re.sub(r"星期", "周", _cell_text(c))
@@ -215,13 +240,16 @@ def get_pdf_table_text(pdf_bytes):
                     for row in (table or []):
                         all_rows.append(row)
             if all_rows:
+                # 过滤图例/杂项行（如": 理论 : 上机 : 实验..."）
+                all_rows = [r for r in all_rows
+                            if not re.match(r"^[:：]", "".join(_cell_text(c) for c in r).strip())]
                 # 自动定位表头行（含≥3个星期标签的行），丢弃其上方的标题/杂项行
                 hdr_idx = -1
                 for i, r in enumerate(all_rows):
                     if sum(1 for c in r if _norm_header(c) in WEEK_NAMES) >= 3:
                         hdr_idx = i
                         break
-                has_day_header = hdr_idx >= 0 or bool(re.search(r"星期|周[一二三四五六日]", "".join(_cell_text(c) for c in all_rows[0])))
+                has_day_header = hdr_idx >= 0 or bool(re.search(r"星期|周[一二三四五六日]", "".join(_cell_text(c) for c in all_rows[0]))) if all_rows else False
                 # 表头不在表格里时不用表格线结果（列无法映射星期），降级走锚点网格
                 if has_day_header:
                     if hdr_idx >= 0:
@@ -235,6 +263,18 @@ def get_pdf_table_text(pdf_bytes):
                         if not any("节次" in h for h in header):
                             header = ["节次"] + list(header)
                             body = [[str(i + 1)] + list(r) for i, r in enumerate(body)]
+                        # 合并跨页/合并单元格产生的无节次延续行，避免AI误判行位置
+                        sec_col = next((i for i, h in enumerate(header) if "节次" in h), -1)
+                        if sec_col >= 0:
+                            merged = []
+                            for r in body:
+                                cells = ([_cell_text(c) for c in list(r)] + [""] * len(header))[:len(header)]
+                                if not cells[sec_col] and merged:
+                                    prev = (list(merged[-1]) + [""] * len(header))[:len(header)]
+                                    merged[-1] = [(a + " " + b).strip() if b else a for a, b in zip(prev, cells)]
+                                else:
+                                    merged.append(cells)
+                            body = merged
                         text = _build_markdown_table(body, header)
                         text = re.sub(r"打印时间[:：].*", "", text)
                         text = re.sub(r"学号[:：].*", "", text)
@@ -384,7 +424,44 @@ def _call_course_ai(prompt_text:str):
             last_err = e
     raise last_err
 
-# ========= 视觉路线（主路线）：qwen-vl-max 直接看课表图片（带重试） =========
+# ========= 二次校验：把初稿+原文交回AI逐条核对，删幻觉、补遗漏 =========
+VERIFY_PROMPT = """
+任务：核对并修正课表提取初稿。
+规则：
+1. 初稿中每一条(week,sections)都必须能在课表原文中找到对应星期列、对应节次行的课程格子；找不到的整条删除，禁止保留。
+2. 原文中存在但初稿漏掉的课程格子一律补上，注意单元格内"(X-Y节)"表示连排，sections要含全部节次。
+3. 输出字段仅允许week、sections、courses；只输出纯净JSON数组，禁止解释、禁止markdown。
+"""
+
+def _verify_course_ai(table_text:str, draft):
+    check_prompt = f"""课表原文：
+{table_text[:12000]}
+
+初步提取结果（待核对）：
+{json.dumps(draft, ensure_ascii=False)}
+"""
+    last_err = None
+    for _ in range(MAX_RETRY + 1):
+        try:
+            resp = Generation.call(
+                model=COURSE_TEXT_MODEL,
+                messages=[
+                    {"role":"system","content":EXTRACT_SYS_PROMPT + "\n" + VERIFY_PROMPT},
+                    {"role":"user","content":check_prompt}
+                ],
+                temperature=0.0,
+                max_tokens=2000,
+                result_format="message"
+            )
+            if resp.status_code != 200:
+                raise ValueError(f"千问校验API异常 code:{resp.status_code} {resp.message}")
+            out = resp.output.choices[0].message.content
+            return _parse_json_array(out)
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+# ========= 视觉路线：qwen-vl-max 直接看课表图片（带重试） =========
 def _call_course_ai_vl(images_b64):
     if not images_b64:
         raise ValueError("课表PDF渲染图片失败")
@@ -484,7 +561,16 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
         try:
             ai_course_data = _clean_course_data(_call_course_ai(prompt_course))
             if ai_course_data:
-                route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}"
+                # 二次校验：核对初稿，删除原文不支持的、补充遗漏的
+                try:
+                    verified = _clean_course_data(_verify_course_ai(table_text, ai_course_data))
+                    if verified:
+                        ai_course_data = verified
+                        route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}（含二次校验）"
+                    else:
+                        route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}"
+                except Exception:
+                    route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}"
         except Exception:
             ai_course_data = []
     # ---- 路线2：其余情况（网格近似/图片型PDF/文本路线失败）→ 视觉大模型直接读图（最准） ----
@@ -707,6 +793,10 @@ if "temp_new_member" not in st.session_state:
     st.session_state.temp_new_member = []
 if "temp_pdf_bytes" not in st.session_state:
     st.session_state.temp_pdf_bytes = []
+if "member_pending" not in st.session_state:
+    st.session_state.member_pending = None
+if "ai_failed_names" not in st.session_state:
+    st.session_state.ai_failed_names = []
 _query = st.query_params
 _is_self_page = _query.get("page", "") == "self"
 if _is_self_page:
@@ -728,11 +818,6 @@ if menu == "管理员后台":
                     st.rerun()
                 else:
                     st.error("账号或密码错误（默认账号：admin，密码：123456）")
-        with col2:
-            if st.button("🔧 一键重置为默认账号密码 admin / 123456"):
-                reset_default_admin()
-                st.success("✅ 重置完成！现在账号admin，密码123456，直接登录")
-                st.rerun()
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
         st.caption("链路：PDF→表格线/锚点网格提取（失败自动切换）→qwen‑vl‑max视觉模型直接读图识别课表；doubao2.1‑seed‑pro解析个性化")
@@ -743,6 +828,8 @@ if menu == "管理员后台":
             tab6 = None
         with tab1:
             st.subheader("批量上传PDF课表（文件名格式：身份&姓名&手机号‑课表.pdf）")
+            if st.session_state.ai_failed_names:
+                st.warning("⚠️ 以下人员课表识别异常，请手动核对/补填不能值班时段：" + "、".join(st.session_state.ai_failed_names))
             up_files = st.file_uploader("选择课表PDF", type="pdf", accept_multiple_files=True)
             if up_files and st.button("📂 第一步：缓存PDF二进制，解析姓名身份电话"):
                 with st.spinner("读取PDF文件..."):
@@ -817,8 +904,9 @@ if menu == "管理员后台":
                                 row["name"] = safe_str(row.get("name"))
                                 row["phone"] = safe_str(row.get("phone"))
                                 row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
+                            # 记录识别异常人员，rerun后在页面上方提示人工核对
+                            st.session_state.ai_failed_names = [safe_str(r.get("name")) for r in current_rows if is_recognize_failed(r.get("class_conflict"))]
                             st.session_state.temp_new_member = current_rows
-                            st.success("AI识别完成，请点开DEBUG面板核对原始课表JSON，防止AI幻觉脑补课程")
                             st.rerun()
                         else:
                             st.info("所有人都已识别，不需要AI！")
@@ -828,23 +916,35 @@ if menu == "管理员后台":
                         exist_names = {x["name"] for x in all_mem}
                         add_list = edited_temp.to_dict("records")
                         new_add = []
+                        skipped = []
                         for row in add_list:
                             nm = safe_str(row.get("name"))
-                            if nm and nm not in exist_names:
-                                row["personal_need"] = safe_str(row.get("personal_need"))
-                                row["class_conflict"] = safe_str(row.get("class_conflict"))
-                                row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
-                                new_add.append(row)
+                            if not nm or nm in exist_names:
+                                continue
+                            row["personal_need"] = safe_str(row.get("personal_need"))
+                            row["class_conflict"] = safe_str(row.get("class_conflict"))
+                            row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
+                            # 识别失败/为空的记录直接入库会导致排班静默出错，必须人工补填后再保存
+                            if is_recognize_failed(row["class_conflict"]):
+                                skipped.append(nm)
+                                continue
+                            new_add.append(row)
                         all_mem.extend(new_add)
                         save_members(all_mem)
-                        st.success(f"成功录入 {len(new_add)} 人！")
-                        st.session_state.temp_new_member = []
-                        st.session_state.temp_pdf_bytes = []
-                        st.rerun()
+                        if skipped:
+                            st.session_state.ai_failed_names = skipped
+                            st.error(f"⚠️ 已有 {len(new_add)} 人入库；以下 {len(skipped)} 人识别异常或时段为空，未入库，请手动补填后再次保存：{'、'.join(skipped)}")
+                        else:
+                            st.session_state.ai_failed_names = []
+                            st.session_state.temp_new_member = []
+                            st.session_state.temp_pdf_bytes = []
+                            st.success(f"成功录入 {len(new_add)} 人！")
+                            st.rerun()
                 with col_c:
                     if st.button("❌ 放弃本批"):
                         st.session_state.temp_new_member = []
                         st.session_state.temp_pdf_bytes = []
+                        st.session_state.ai_failed_names = []
                         st.rerun()
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
@@ -1018,32 +1118,67 @@ if menu == "管理员后台":
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("链路：PDF→表格线/锚点网格提取（失败自动切换）→qwen‑vl‑max视觉模型直接读图识别课表；doubao2.1‑seed‑pro解析个性化")
+    st.caption("识别逻辑与管理员后台上传完全一致：PDF→表格线/锚点网格提取（失败自动切换）→qwen‑vl‑max视觉模型直接读图识别课表；doubao2.1‑seed‑pro解析个性化需求。提交前请核对识别结果。")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
         role_sel = st.radio("身份", ["学员","职委"])
         limit_input = st.text_input("个性化需求（选填，各种说法都行：周末不值班 / 只在周六下午有空 / 周一上午有课）")
         pdf_file = st.file_uploader("上传你的课表PDF", type="pdf")
-        submit = st.form_submit_button("提交")
-        if submit:
-            if not (name and phone and pdf_file):
-                st.warning("姓名、电话、课表都需要填！")
+        submit = st.form_submit_button("① 开始识别课表")
+    if submit:
+        if not (name and phone and pdf_file):
+            st.warning("姓名、电话、课表都需要填！")
+        else:
+            with st.spinner("AI分析课表，请稍候..."):
+                pdf_bin = pdf_file.read()
+                class_conflict = fast_ai_extract(pdf_bin, limit_input)
+            if is_recognize_failed(class_conflict):
+                st.session_state.member_pending = None
+                st.error(f"❌ 课表识别未成功：{class_conflict}。请重新上传清晰、完整的教务系统课表PDF；若多次失败请联系管理员手动录入。")
             else:
-                with st.spinner("AI分析课表，请稍候..."):
-                    pdf_bin = pdf_file.read()
-                    class_conflict = fast_ai_extract(pdf_bin, limit_input)
-                    personal_need = safe_str(limit_input)
+                st.session_state.member_pending = {
+                    "name": safe_str(name),
+                    "phone": safe_str(phone),
+                    "role": role_sel,
+                    "class_conflict": class_conflict,
+                    "personal_need": safe_str(limit_input),
+                }
+                st.rerun()
+    pending = st.session_state.get("member_pending")
+    if pending:
+        st.divider()
+        st.subheader("② 核对识别结果，确认后提交入库")
+        st.info(f"识别到 {len([x for x in pending['class_conflict'].split('、') if x])} 个不能值班时段。请对照你的课表检查：多出或缺少的时段可以直接修改下面的文字。")
+        edited_conflict = st.text_area(
+            "我不能值班的时段（用「、」分隔，例如：周二下午、周五晚上）",
+            value=pending["class_conflict"], height=100,
+            key=f"member_confirm_{pending['name']}_{abs(hash(pending['class_conflict'])) % 100000}")
+        st.caption(f"提交人：{pending['name']} ｜ 电话：{pending['phone']} ｜ 身份：{pending['role']}")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ 确认无误，提交入库"):
+                final_conflict = normalize_conflict_text(edited_conflict)
+                if not final_conflict:
+                    st.error("时段格式不正确：请按「周二下午」这样的格式填写，多个时段用「、」分隔。")
+                else:
                     all_mem = load_members()
                     exist = False
                     for m in all_mem:
-                        if m["name"] == name:
-                            m["phone"] = phone
-                            m["role"] = role_sel
-                            m["class_conflict"] = class_conflict
-                            m["personal_need"] = personal_need
+                        if m["name"] == pending["name"]:
+                            m["phone"] = pending["phone"]
+                            m["role"] = pending["role"]
+                            m["class_conflict"] = final_conflict
+                            m["personal_need"] = pending["personal_need"]
                             exist = True
                     if not exist:
-                        all_mem.append({"name":name,"phone":phone,"role":role_sel,"class_conflict":class_conflict,"personal_need":personal_need})
+                        all_mem.append({"name": pending["name"], "phone": pending["phone"], "role": pending["role"],
+                                        "class_conflict": final_conflict, "personal_need": pending["personal_need"]})
                     save_members(all_mem)
-                st.success("提交成功！AI已综合识别你所有不能值班的时段。")
+                    st.session_state.member_pending = None
+                    st.success("提交成功！管理员已能看到你的不能值班时段。")
+                    st.rerun()
+        with c2:
+            if st.button("🔁 重新上传课表"):
+                st.session_state.member_pending = None
+                st.rerun()
