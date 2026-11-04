@@ -1969,7 +1969,10 @@ if menu == "管理员后台":
                 with wb2:
                     if st.button("🗑️ 移除壁纸"):
                         clear_wallpaper()
-                        st.session_state["wallpaper_enabled"] = False
+                        # 不能直接赋值：toggle 已在本轮实例化，赋值会抛
+                        # StreamlitWidgetAlreadyInstantiatedError。删除 key 让控件
+                        # 回落到默认值，下一轮 apply_wallpaper 会读到配置里的 enabled=False。
+                        st.session_state.pop("wallpaper_enabled", None)
                         st.success("已移除壁纸，恢复默认白色背景")
                         st.rerun()
                 st.caption("说明：拖动滑块会立即预览效果，点「保存壁纸设置」才会持久化（云端重启后仍生效）。"
