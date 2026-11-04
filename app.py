@@ -43,7 +43,7 @@ except KeyError:
     st.stop()
 API_TIMEOUT = 30
 MAX_RETRY = 2
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 SHIFT_LIST = [
     {"shift_idx":0,"shift_name": "9:00-13:00", "need_stu": 2, "need_wei": 1},
     {"shift_idx":1,"shift_name": "13:00-17:00", "need_stu": 2, "need_wei": 1},
@@ -230,7 +230,21 @@ def _grid_extract_text(pdf_bytes, row_count=13, col_count=7):
     return table_text
 
 def get_pdf_table_text(pdf_bytes):
-    """三级提取，返回 (文本, 方式)。方式: table=表格线识别 grid=坐标网格 raw=纯文本 none=失败"""
+    """四级提取，返回 (文本, 方式)。方式: list=清单式 table=表格线识别 grid=坐标网格 raw=纯文本 none=失败"""
+    # ⓪ 清单式课表解析（武大部分导出版式：逐块列出 星期X/节次段/课程名/周数详情，无网格）
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        raw = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        raw = ""
+    if raw:
+        try:
+            list_md = _parse_list_style_text(raw)
+            if list_md:
+                return list_md, "list"
+        except Exception:
+            pass
     # ① pdfplumber 表格线识别（有框线课表最准）
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
@@ -300,6 +314,222 @@ def get_pdf_table_text(pdf_bytes):
         pass
     return "", "none"
 
+def _parse_list_style_text(raw_text):
+    """清单式课表解析：结构为 星期X → [节次段(如3-4), 课程名, 周数:...] 逐块排列。
+    每个块必须看到"周数"行才认定有效（防止网格版课表误触发）。
+    返回规整Markdown表格（| 星期 | 节次 | 课程 | 详情 |），不匹配返回空串。"""
+    if not raw_text or "周数" not in raw_text:
+        return ""
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    sec_line_re = re.compile(r"^(\d{1,2})\s*[-–—]\s*(\d{1,2})$")
+    rows = []
+    week = None
+    state = "idle"  # idle=等星期/节次段  course=收课程名  detail=收周数详情
+    cur_secs, cur_course, cur_detail, cur_has_detail = "", [], [], False
+
+    def flush():
+        nonlocal cur_secs, cur_course, cur_detail, cur_has_detail
+        if week and cur_secs and cur_course and cur_has_detail:
+            rows.append((week, cur_secs, "".join(cur_course), "".join(cur_detail)))
+        cur_secs, cur_course, cur_detail, cur_has_detail = "", [], [], False
+
+    for l in lines:
+        wm = re.fullmatch(r"星期([一二三四五六日])", l)
+        if wm:
+            flush()
+            week = "周" + wm.group(1)
+            state = "idle"
+            continue
+        sm = sec_line_re.match(l)
+        if sm and week:
+            flush()  # 上一块异常未闭合也先落盘
+            cur_secs = f"{int(sm.group(1))}-{int(sm.group(2))}"
+            state = "course"
+            continue
+        if state == "course":
+            if l.startswith("周数"):
+                cur_detail = [l]
+                cur_has_detail = True
+                state = "detail"
+            elif len(l) <= 60 and not l.startswith(("(", ")")):
+                cur_course.append(l)
+        elif state == "detail":
+            if l.startswith("周数"):
+                flush()
+                cur_detail = [l]
+                cur_has_detail = True
+                state = "detail"
+            else:
+                cur_detail.append(l)  # 周数行被换行拆开的尾巴
+    flush()
+    if len(rows) < 2:
+        return ""
+    md = ["| 星期 | 节次 | 课程 | 详情 |", "| ---- | ---- | ---- | ---- |"]
+    for wk, secs, name, detail in rows:
+        detail = re.split(r"/教学班", detail)[0][:120]
+        md.append(f"| {wk} | {secs} | {name[:40]} | {detail} |")
+    return "\n".join(md)
+
+def _week_norm(s):
+    return re.sub(r"星期", "周", safe_str(s).strip())
+
+def parse_table_courses(table_text, method):
+    """确定性规则解析：直接从规整表格提取（星期,节次），零幻觉、零成本。
+    返回 (course_data, covered_cells, total_text_cells, partial_weeks)：
+    covered==text_cells 表示有内容的星期单元格全部解析成功；
+    partial_weeks 是"存在无法解析单元格"的星期集合，允许AI在这些星期上补漏。"""
+    result, covered, text_cells, partial = [], 0, 0, set()
+    lines = [l for l in (table_text or "").splitlines() if l.startswith("|")]
+    if len(lines) < 3:
+        return result, covered, text_cells, partial
+
+    def cells_of(line):
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    header = cells_of(lines[0])
+    sec_pat = re.compile(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*节")
+    single_pat = re.compile(r"(?<![0-9])(\d{1,2})\s*节(?![0-9])")
+    data = {}  # week -> set(sections)
+
+    if method == "list":
+        # | 星期 | 节次 | 课程 | 详情 |，节次列为"3-4"/"11-13"
+        wi = next((i for i, h in enumerate(header) if h == "星期"), -1)
+        si = next((i for i, h in enumerate(header) if h == "节次"), -1)
+        if wi < 0 or si < 0:
+            return result, covered, text_cells, partial
+        for line in lines[2:]:
+            cells = cells_of(line)
+            cells += [""] * (len(header) - len(cells))
+            wk = _week_norm(cells[wi])
+            if wk not in WEEK_NAMES:
+                continue
+            text_cells += 1
+            m = re.fullmatch(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})", cells[si])
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                if 1 <= a <= b <= 13:
+                    data.setdefault(wk, set()).update(range(a, b + 1))
+                    covered += 1
+                    continue
+            partial.add(wk)  # 节次列解析失败 → 交给AI补
+    else:
+        # 框线表格：表头为星期名，单元格内"(X-Y节)"标注节次
+        week_cols = {}
+        for i, h in enumerate(header):
+            w = _week_norm(h)
+            if w in WEEK_NAMES:
+                week_cols[i] = w
+        if not week_cols:
+            return result, covered, text_cells, partial
+        sec_col = next((i for i, h in enumerate(header) if "节次" in h), -1)
+        week_stat = {w: [0, 0] for w in week_cols.values()}  # [text_cells, covered]
+        for line in lines[2:]:
+            cells = cells_of(line)
+            cells += [""] * (len(header) - len(cells))
+            row_sec = None
+            if sec_col >= 0:
+                m = re.fullmatch(r"(\d{1,2})", cells[sec_col])
+                if m:
+                    row_sec = int(m.group(1))
+            for ci, wk in week_cols.items():
+                cell = cells[ci] if ci < len(cells) else ""
+                if not cell:
+                    continue
+                text_cells += 1
+                week_stat[wk][0] += 1
+                secs = set()
+                for m2 in sec_pat.finditer(cell):
+                    a, b = int(m2.group(1)), int(m2.group(2))
+                    if 1 <= a <= b <= 13:
+                        secs.update(range(a, b + 1))
+                if not secs:
+                    m3 = single_pat.search(cell)
+                    if m3 and 1 <= int(m3.group(1)) <= 13:
+                        secs.add(int(m3.group(1)))
+                if secs:
+                    covered += 1
+                    week_stat[wk][1] += 1
+                elif row_sec and re.search(r"[\u4e00-\u9fa5A-Za-z]", cell):
+                    secs = {row_sec}
+                    covered += 1
+                    week_stat[wk][1] += 1
+                if secs:
+                    data.setdefault(wk, set()).update(secs)
+        partial = {w for w, (t, c) in week_stat.items() if t > c}
+    result = [{"week": w, "sections": sorted(s), "courses": []} for w, s in data.items()]
+    return result, covered, text_cells, partial
+
+def _merge_course_data(rule, ai):
+    """规则解析与AI结果取并集（按星期合并节次），偏召回：宁可多核对，不可漏课。"""
+    merged = {}
+    for src in (rule or [], ai or []):
+        for e in src:
+            w = e.get("week", "")
+            if w not in WEEK_NAMES:
+                continue
+            m = merged.setdefault(w, {"week": w, "sections": set(), "courses": []})
+            m["sections"].update(x for x in e.get("sections", []) if isinstance(x, int))
+            for c in e.get("courses", []):
+                c = safe_str(c)
+                if c and c not in m["courses"]:
+                    m["courses"].append(c)
+    return [{"week": w, "sections": sorted(s), "courses": c} for w, m in merged.items()
+            for s, c in [(m["sections"], m["courses"])] if s]
+
+def _filter_ai_by_table(ai_data, table_text):
+    """廉价抗幻觉：AI给出的星期必须在表格中真实存在（对应列/行有非空内容），否则丢弃该条。"""
+    if not ai_data:
+        return ai_data
+    lines = [l for l in (table_text or "").splitlines() if l.startswith("|")]
+    if len(lines) < 3:
+        return ai_data
+    header = [c.strip() for c in lines[0].strip().strip("|").split("|")]
+    col_idx, list_week_col = {}, -1
+    for i, h in enumerate(header):
+        w = _week_norm(h)
+        if w in WEEK_NAMES:
+            col_idx[w] = i
+        elif h == "星期":
+            list_week_col = i
+    if list_week_col >= 0:
+        # 清单式：星期列里出现过的星期才算真实存在
+        present = set()
+        for line in lines[2:]:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if list_week_col < len(cells):
+                w = _week_norm(cells[list_week_col])
+                if w in WEEK_NAMES:
+                    present.add(w)
+        if present:
+            return [e for e in ai_data if e.get("week") in present]
+        return ai_data
+    if not col_idx:
+        return ai_data
+    col_has_content = {w: False for w in col_idx}
+    for line in lines[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        for w, i in col_idx.items():
+            if i < len(cells) and cells[i]:
+                col_has_content[w] = True
+    return [e for e in ai_data if col_has_content.get(e.get("week", ""), True)]
+
+def _gate_ai_by_rule(ai_data, rule_data, partial_weeks):
+    """AI补漏闸门：规则已完整解析的星期，AI不得新增或删减节次（防幻觉）；
+    只有规则解析存疑的星期（partial_weeks），才允许AI补充。规则整体为空时不限制。"""
+    if not ai_data:
+        return ai_data
+    if not rule_data:
+        return ai_data
+    base = {e["week"]: set(e["sections"]) for e in rule_data}
+    out = []
+    for e in ai_data:
+        w = e.get("week", "")
+        secs = set(e.get("sections", []))
+        keep = secs if w in partial_weeks else (secs & base.get(w, set()))
+        if keep:
+            out.append({"week": w, "sections": sorted(keep), "courses": list(e.get("courses", []))})
+    return out
+
 def pdf_to_images_b64(pdf_bytes, max_pages=2, zoom=2.5):
     """把课表PDF整页渲染成高清PNG，供视觉大模型直接读图。"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -342,7 +572,8 @@ EXTRACT_SYS_PROMPT = """
 4.courses是该星期的课程名数组（如["高等数学","大学英语"]），仅作核对用，取不到就给[]。
 5.某星期完全无课，该星期不要写入数组。
 6.⚠️合并单元格：一个课程格子如果跨多节（如第1‑2节连排、第3‑5节大课），sections必须包含它占据的所有节次，一个都不能漏。
-7.只输出纯净JSON数组，禁止```、注释、markdown、任何解释文字。
+7.表格里的节次有两种写法：单元格内"(X-Y节)"，或单独一节次列写成"3-4"/"11-13"，两种都要按区间展开成全部节次。
+8.只输出纯净JSON数组，禁止```、注释、markdown、任何解释文字。
 节次参考：
 1:08:00-08:45｜2:08:50-09:35｜3:09:50-10:35｜4:10:40-11:25｜5:11:30-12:15
 6:14:05-14:50｜7:14:55-15:40｜8:15:45-16:30｜9:16:40-17:25
@@ -353,15 +584,24 @@ EXTRACT_USER_PROMPT_VL = """这是一张大学课表的图片（可能有多张�
 表格布局：最上面一行是表头（周一到周日），左边一列是节次标签（第1节到第13节及时间），中间每个格子是课程信息（课程名、教室、教师，一门课可能连排多节）。
 请逐格仔细看图，提取所有有课的（星期, 节次）组合，严格按系统要求的JSON数组格式输出。格子为空就是没课，绝对不要脑补。"""
 PERSONAL_SYS_PROMPT = """
-任务：解析用户个性化额外禁止值班需求，输出JSON字符串数组。
+任务：从用户原话中提取"额外不能值班的时段"，输出JSON数组，每条必须带原话证据。
+输出格式：[{"slot":"周日下午","evidence":"用户原话中支持该时段的逐字片段"}]
 铁律：
-1. 不许重复课表已经算出的冲突时段！**只提取用户原话明确说出的限制，禁止脑补、禁止联想额外限制。**
-2.输出只能是："周X上午"、"周X下午"、"周X晚上"
-3.合法集合：["周一上午","周一下午","周一晚上","周二上午","周二下午","周二晚上","周三上午","周三下午","周三晚上","周四上午","周四下午","周四晚上","周五上午","周五下午","周五晚上","周六上午","周六下午","周六晚上","周日上午","周日下午","周日晚上"]
-4.没有额外限制返回[]。
-5.只输出纯JSON，禁止markdown、注释、解释。
-✅示例：["周日上午","周二晚上"]
-✅无限制示例：[]
+1. **evidence必须是用户原话里连续逐字出现的片段**（可忽略空格与标点），禁止改写、拼接、编造、同义替换。原话里找不到依据的时段，一条都不许输出。
+2. slot只能是：周X上午 / 周X下午 / 周X晚上（X=一二三四五六日），共21种，禁止其他写法（不许写"周末"、"工作日"、"周天"）。
+3. 只提取用户明确说出的限制，禁止联想、禁止推断、禁止帮忙补全。用户没提到的时段绝不输出。宁可少输出，绝不脑补。
+4. 语义方向判定（关键，不要搞反）：
+   - "有课/上课/不能/不行/没空/没时间/不值班/不方便/有事/要走" → 该时段**要输出**
+   - "没课/有空/有时间/可以/能值班/能来/方便" → 该时段是**可用时段，禁止输出**
+   - "周末不值班" → 周六上午/周六下午/周六晚上/周日上午/周日下午/周日晚上（6项）
+   - "只在周六下午有空"（或"只有周六下午能来"）→ 输出**除周六下午外的其余20项**
+   - "每天上午有课" → 周一~周日上午（7项）；"工作日"=周一~周五；"周中"=周一~周五
+5. 不要输出课表已经算出的冲突时段（用户消息里已给出）。
+6. 只输出纯JSON数组，禁止markdown、注释、解释。没有额外限制就输出 []。
+✅示例：用户说"我周二下午有课，另外周末不值班"
+→ [{"slot":"周二下午","evidence":"周二下午有课"},{"slot":"周六上午","evidence":"周末不值班"},{"slot":"周六下午","evidence":"周末不值班"},{"slot":"周六晚上","evidence":"周末不值班"},{"slot":"周日上午","evidence":"周末不值班"},{"slot":"周日下午","evidence":"周末不值班"},{"slot":"周日晚上","evidence":"周末不值班"}]
+✅示例：用户说"周二下午没课"
+→ []
 """
 
 def _make_http_session():
@@ -509,9 +749,144 @@ def _call_personal_ai(prompt_text:str):
     if not match:
         return []
     arr = json.loads(match.group(0))
-    raw_list = [s.strip() for s in arr if isinstance(s,str)]
-    filtered = [x for x in raw_list if x in ALL_SLOTS]
-    return filtered
+    return arr if isinstance(arr, list) else []
+
+# ========= 个性化需求【幻觉压制层】：原话证据回溯 + 语义方向判定 + 确定性规则底稿 =========
+_BUSY_MARKERS = ("有课", "上课", "不能", "不行", "不可以", "没空", "没有空", "没时间",
+                 "不值班", "不能值班", "不方便", "走不开", "冲突", "忙", "有事")
+_AVAIL_MARKERS = ("没课", "没有课", "不上课", "有空", "有时间", "可以", "能值班", "能来", "方便", "没事")
+
+def _norm_for_match(s):
+    """用于"原话证据逐字回溯"的归一化：只留文字与数字，去掉空白标点。"""
+    return re.sub(r"[\s，,。.、；;：:！!？?“”\"'‘’（）()【】\[\]…—－\-~·]+", "", safe_str(s))
+
+def _days_in_clause(c):
+    days = []
+    for d in WEEK_NAMES:
+        if d in c:
+            days.append(d)
+    if "周末" in c or "双休" in c:
+        days += ["周六", "周日"]
+    if "每天" in c or "天天" in c:
+        days += list(WEEK_NAMES)
+    if "工作日" in c or "周中" in c or "平时" in c:
+        days += WEEK_NAMES[:5]
+    seen, out = set(), []
+    for d in days:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+def _shifts_in_clause(c):
+    shifts = []
+    if "上午" in c or "早上" in c or "早晨" in c:
+        shifts.append("上午")
+    if "下午" in c or "中午" in c:
+        shifts.append("下午")
+    if "晚上" in c or "傍晚" in c or "夜间" in c:
+        shifts.append("晚上")
+    seen, out = set(), []
+    for s in shifts:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+def _only_available_set(c):
+    """"只在周六下午有空" → 返回可用时段集合（其余全部禁排）；不是这种句式返回 None。"""
+    if not ("只" in c or "仅" in c):
+        return None
+    if not any(m in c for m in ("有空", "可以", "能", "方便", "有时间", "没课", "不上课")):
+        return None
+    days = _days_in_clause(c)
+    if not days:
+        return None
+    shifts = _shifts_in_clause(c) or list(("上午", "下午", "晚上"))
+    return {f"{d}{s}" for d in days for s in shifts}
+
+def parse_personal_rulebased(text):
+    """确定性规则底稿：常见口语说法直接翻译为禁排时段，不依赖AI，永不幻觉。"""
+    slots = set()
+    t = safe_str(text)
+    if not t:
+        return slots
+    # 先按标点+转折词切分，避免"周一上午没课但周二下午不能来"被当成一个整体
+    parts = re.split(r"[，,。.、；;！!？?\n]+|但是|但|不过|可是|然而", t)
+    for c0 in parts:
+        c = _norm_for_match(c0)
+        if not c:
+            continue
+        days = _days_in_clause(c)
+        if not days:
+            continue
+        shifts = _shifts_in_clause(c) or ["上午", "下午", "晚上"]
+        allowed = _only_available_set(c)
+        if allowed is not None:  # "只在X有空" → 补集
+            slots |= {s for s in ALL_SLOTS if s not in allowed}
+            continue
+        if any(m in c for m in _BUSY_MARKERS):
+            slots |= {f"{d}{s}" for d in days for s in shifts}
+        # 只出现"有空/没课"等可用词、没有忙词 → 不加入
+    return slots
+
+def _validate_personal_slots(raw, text):
+    """逐条校验AI输出：证据必须能在原话中逐字回溯，且星期/时段对得上、语义方向正确。"""
+    valid = set()
+    tnorm = _norm_for_match(text)
+    if not tnorm:
+        return valid
+    for item in raw or []:
+        if isinstance(item, dict):
+            slot = _norm_for_match(item.get("slot", ""))
+            ev = _norm_for_match(item.get("evidence", ""))
+        else:
+            slot, ev = _norm_for_match(item), ""
+        slot = re.sub(r"星[期其]", "周", slot)
+        slot = slot.replace("周天", "周日")
+        if slot not in ALL_SLOTS:
+            continue                      # ① 非法时段写法直接丢
+        if not ev or ev not in tnorm:
+            continue                      # ② 证据无法在原话中逐字回溯 → 判定为幻觉，丢
+        allowed = _only_available_set(ev)
+        if allowed is not None:           # ③ "只在X有空"的补集语义
+            if slot not in allowed:
+                valid.add(slot)
+            continue
+        if slot[:2] not in _days_in_clause(ev):
+            continue                      # ④ 证据里没提这个星期 → 丢
+        ev_shifts = _shifts_in_clause(ev)
+        if ev_shifts and slot[2:] not in ev_shifts:
+            continue                      # ⑤ 证据写了具体时段但对不上 → 丢（没写时段视为早中晚全含）
+        if any(m in ev for m in _BUSY_MARKERS):
+            valid.add(slot)               # ⑥ 语义方向为"忙/不能" → 采纳
+        elif any(m in ev for m in _AVAIL_MARKERS):
+            continue                      # ⑦ 语义方向是"有空/没课" → 拒绝（AI搞反了）
+    return valid
+
+def extract_personal_slots(personal_need, course_conflict):
+    """个性化需求统一入口：规则底稿 ∪ 经证据校验的AI结果，返回 (slots, 调试信息)。"""
+    rule_slots = parse_personal_rulebased(personal_need)
+    ai_raw, ai_slots, ai_err = [], set(), ""
+    prompt_personal = f"""
+课表已经算出的不能值班时段（不要再重复输出）：{json.dumps(course_conflict, ensure_ascii=False)}
+用户个性化需求原话：{personal_need}
+请按系统要求输出JSON数组，每条含 slot 与 evidence（evidence必须逐字来自上面的原话）。
+"""
+    try:
+        ai_raw = _call_personal_ai(prompt_personal)
+        ai_slots = _validate_personal_slots(ai_raw, personal_need)
+    except Exception as e:
+        ai_err = str(e)[:80]
+    final = sorted((rule_slots | ai_slots) - set(course_conflict))
+    info = {
+        "rule_slots": sorted(rule_slots),
+        "ai_raw": ai_raw,
+        "ai_valid_slots": sorted(ai_slots),
+        "ai_err": ai_err,
+        "dropped_by_validation": len(ai_raw) - len([1 for x in ai_raw if isinstance(x, dict) and _norm_for_match(x.get("slot", "")) in ai_slots]),
+    }
+    return final, info
 
 # 节次时间(分钟，从0点起算)
 SECTION_TIME = {
@@ -549,39 +924,56 @@ def calc_course_conflict(ai_course_data):
     return sorted(list(conflict))
 
 def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
+    """智能体主链路：AI 全程参与识别；规则解析作为确定性底稿与防幻觉闸门。
+    路线：① 表格/清单式 → 规则解析 + qwen 文本模型（AI补漏、规则兜底）
+          ② 网格/图片型 → qwen-vl-max 视觉直接读图
+          ③ 全部失败 → 文本模型兜底
+    """
     table_text, method = get_pdf_table_text(pdf_bytes)
     ai_course_data = []
     route = ""
+    rule_data, rule_covered, rule_text_cells, rule_partial = [], 0, 0, set()
+    ai_agree = None
     prompt_course = f"""
-下面是课表原文（Markdown表格）。表头行标注了星期几（顺序可能从周日开始，以表头实际标注为准）；有一列是节次编号；每个课程单元格里的"(X-Y节)"表示该课占据第X节到第Y节。请提取所有有课的星期和节次，以单元格的星期列位置和其内的(X-Y节)信息为准：
+下面是课表原文（Markdown表格）。表头行标注了星期几（顺序可能从周日开始，以表头实际标注为准）；有一列是节次编号；节次可能写在单元格内"(X-Y节)"，也可能写成"3-4"这种区间，两种都表示该课占据第X节到第Y节。请提取所有有课的星期和节次，以单元格的星期列位置和节次信息为准：
 {table_text[:12000]}
 """
-    # ---- 路线1：仅当提取出"框线+真实星期表头"的高置信表格 → 文本模型（快、省） ----
-    if method == "table" and len(table_text.strip()) >= 10:
+    # ---- 路线①：表格/清单式 → 规则解析 + AI 文本模型 双通道（AI始终参与） ----
+    if method in ("table", "list") and len(table_text.strip()) >= 10:
         try:
-            ai_course_data = _clean_course_data(_call_course_ai(prompt_course))
-            if ai_course_data:
-                # 二次校验：核对初稿，删除原文不支持的、补充遗漏的
-                try:
-                    verified = _clean_course_data(_verify_course_ai(table_text, ai_course_data))
-                    if verified:
-                        ai_course_data = verified
-                        route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}（含二次校验）"
-                    else:
-                        route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}"
-                except Exception:
-                    route = f"文本路线：框线表格提取 + {COURSE_TEXT_MODEL}"
+            rule_data, rule_covered, rule_text_cells, rule_partial = parse_table_courses(table_text, method)
         except Exception:
-            ai_course_data = []
-    # ---- 路线2：其余情况（网格近似/图片型PDF/文本路线失败）→ 视觉大模型直接读图（最准） ----
+            rule_data, rule_covered, rule_text_cells, rule_partial = [], 0, 0, set()
+        ai_part, ai_err = [], ""
+        try:
+            ai_part = _clean_course_data(_call_course_ai(prompt_course))
+        except Exception as e:
+            ai_err = str(e)[:60]
+        raw_ai_count = len(ai_part)
+        ai_part = _filter_ai_by_table(ai_part, table_text)          # 抗幻觉①：AI说的星期必须在表格真实存在
+        ai_part = _gate_ai_by_rule(ai_part, rule_data, rule_partial)  # 抗幻觉②：规则已完整覆盖的星期不许AI新增
+        ai_course_data = _merge_course_data(rule_data, ai_part)
+        if ai_course_data:
+            if rule_data:
+                # AI 与规则是否完全一致（用于DEBUG核对）
+                rule_map = {e["week"]: set(e["sections"]) for e in rule_data}
+                ai_map = {e["week"]: set(e["sections"]) for e in ai_part}
+                ai_agree = (rule_map == ai_map)
+                route = (f"双通道路线：规则解析(确定性底稿) ∪ {COURSE_TEXT_MODEL}(AI补漏防幻觉)"
+                         f"｜AI{'一致' if ai_agree else '有补充/差异'}")
+            else:
+                route = f"文本路线：{method}表格 + {COURSE_TEXT_MODEL}（AI主导，规则无可解析项）"
+        elif ai_err:
+            route = f"规则路线：{method}表格直接解析（AI异常已忽略：{ai_err}）"
+    # ---- 路线②：网格近似/图片型PDF/上一路线失败 → 视觉大模型直接读图 ----
     if not ai_course_data:
         try:
             imgs = pdf_to_images_b64(pdf_bytes)
             ai_course_data = _clean_course_data(_call_course_ai_vl(imgs))
             route = f"视觉路线：{COURSE_VL_MODEL} 直接读图"
         except Exception as e_vl:
-            # ---- 路线3：视觉路线也失败 → 文本路线最后兜底 ----
-            if method in ("grid", "raw") and len(table_text.strip()) >= 10:
+            # ---- 路线③：视觉路线也失败 → 文本路线最后兜底 ----
+            if method in ("grid", "raw", "list") and len(table_text.strip()) >= 10:
                 try:
                     ai_course_data = _clean_course_data(_call_course_ai(prompt_course))
                     route = f"文本兜底路线：{method}表格 + {COURSE_TEXT_MODEL}"
@@ -590,27 +982,33 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str=""):
             if not ai_course_data:
                 return f"课表识别失败:{str(e_vl)[:60]}"
     try:
+        course_conflict = calc_course_conflict(ai_course_data)
         if st.runtime.exists():
-            with st.expander(f"🔍DEBUG AI读取课表结果｜识别路线：{route}｜个性化模型：doubao2.1‑seed‑pro"):
+            with st.expander(f"🔍DEBUG 识别详情｜路线：{route}｜个性化模型：doubao2.1‑seed‑pro"):
+                st.caption(f"规则解析（确定性）：{len(rule_data)} 个星期，节次覆盖 {rule_covered}/{rule_text_cells}"
+                           + (f"，AI与规则一致：{'是' if ai_agree else '否'}" if ai_agree is not None else ""))
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
-                if table_text and method in ("table", "grid"):
+                if table_text and method in ("table", "grid", "list"):
                     with st.expander("📄 查看喂给AI的课表表格（核对是否错位）"):
                         st.text(table_text[:3000])
-        course_conflict = calc_course_conflict(ai_course_data)
     except Exception as e:
         return f"课表识别失败:{str(e)[:60]}"
-    personal_conflict = []
-    if personal_need and personal_need.strip() not in ("","无"):
-        prompt_personal = f"""
-课表已经算出不能值班时段：{json.dumps(course_conflict, ensure_ascii=False)}
-用户额外要求：{personal_need}
-只输出用户额外新增禁止的时段，不要包含课表已经有的。
-"""
+    # ---- 个性化需求：doubao 识别 + 原话证据回溯校验（强幻觉压制） ----
+    personal_slots, personal_info = [], {}
+    if personal_need and personal_need.strip() not in ("", "无"):
+        personal_slots, personal_info = extract_personal_slots(personal_need, course_conflict)
         try:
-            personal_conflict = _call_personal_ai(prompt_personal)
+            if st.runtime.exists():
+                with st.expander("🔍DEBUG 个性化需求解析（doubao + 原话证据校验）"):
+                    st.caption(f"规则底稿识别：{'、'.join(personal_info.get('rule_slots') or []) or '无'}")
+                    st.caption(f"AI原始输出（{len(personal_info.get('ai_raw') or [])} 条）")
+                    st.code(json.dumps(personal_info.get("ai_raw") or [], ensure_ascii=False, indent=2), language="json")
+                    st.caption(f"AI通过证据校验：{'、'.join(personal_info.get('ai_valid_slots') or []) or '无'}"
+                               + (f"｜AI异常：{personal_info.get('ai_err')}" if personal_info.get("ai_err") else ""))
+                    st.caption("说明：AI输出的每条时段都必须能在你的原话里找到逐字依据，找不到依据的会被自动丢弃。")
         except Exception:
-            personal_conflict = []
-    total = list(set(course_conflict + personal_conflict))
+            pass
+    total = list(set(course_conflict + personal_slots))
     if not total:
         return "识别为空，请手动填写"
     return "、".join(sorted(total))
@@ -820,7 +1218,7 @@ if menu == "管理员后台":
                     st.error("账号或密码错误（默认账号：admin，密码：123456）")
     else:
         st.title(f"管理员后台｜排班管理（当前登录：{st.session_state.current_admin}）")
-        st.caption("链路：PDF→表格线/锚点网格提取（失败自动切换）→qwen‑vl‑max视觉模型直接读图识别课表；doubao2.1‑seed‑pro解析个性化")
+        st.caption("智能体链路：PDF课表→四级结构化提取（清单式/框线表格/坐标网格/纯文本）→ qwen‑plus 与确定性规则解析双通道互补（AI补漏+闸门防幻觉）；图片型自动切 qwen‑vl‑max 读图；个性化需求由 doubao2.1‑seed‑pro 解析并逐条回溯原话证据")
         if is_super_admin(st.session_state.current_admin):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["批量上传课表","人员库管理","自动排班","导出PDF","分享链接","管理员管理"])
         else:
@@ -1112,13 +1510,20 @@ if menu == "管理员后台":
                         st.success(f"管理员 {delete_user} 已删除！")
                 else:
                     st.info("暂无普通管理员可删除")
+                st.divider()
+                st.markdown("#### 恢复默认账号密码（忘记密码时使用）")
+                st.caption("⚠️ 将清空全部管理员账号，恢复为唯一的默认账号 admin / 123456（添加的其他管理员会被移除）。")
+                confirm_reset = st.checkbox("我确认要执行重置", key="confirm_reset_admin")
+                if st.button("🔧 一键恢复默认账号密码", disabled=not confirm_reset):
+                    reset_default_admin()
+                    st.success("✅ 已重置！现在账号 admin，密码 123456，请重新登录后立即修改密码。")
         if st.button("退出登录"):
             st.session_state.login = False
             st.session_state.current_admin = ""
             st.rerun()
 elif menu == "成员自助上传":
     st.title("成员自助提交信息 & 上传课表")
-    st.caption("识别逻辑与管理员后台上传完全一致：PDF→表格线/锚点网格提取（失败自动切换）→qwen‑vl‑max视觉模型直接读图识别课表；doubao2.1‑seed‑pro解析个性化需求。提交前请核对识别结果。")
+    st.caption("识别逻辑与管理员后台上传完全一致：优先确定性规则解析（清单式/框线课表直接提取，零AI调用零幻觉），异常自动切换qwen‑vl‑max视觉读图；doubao2.1‑seed‑pro解析个性化需求。提交前请核对识别结果。")
     with st.form("member_form"):
         name = st.text_input("姓名")
         phone = st.text_input("联系电话")
