@@ -1425,6 +1425,36 @@ def clear_wallpaper():
                 pass
     save_wallpaper_config({"enabled": False, "alpha": 0.82, "blur": 0, "path": ""})
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def _wallpaper_data_uri(path, mtime, blur):
+    """背景图 → data URI。模糊在服务端用 PIL 做真实高斯模糊后烤进图片里。
+
+    为什么不用 CSS：backdrop-filter 在 Streamlit 的容器结构下会被父级
+    background-attachment: fixed 打断，Chrome 直接采样不到背景，滑块等于没有效果；
+    而给背景层加 filter: blur 又依赖 ::before 的层叠顺序，容易在不同版本失效。
+    直接把像素模糊掉，浏览器只管显示一张图，任何浏览器/任何 Streamlit 版本都一致。
+    mtime 进缓存键：换了图自动失效；同一个 blur 值反复渲染命中缓存，不会重复计算。
+    """
+    with open(path, "rb") as f:
+        data, _ext = _compress_wallpaper(f.read())      # 已有逻辑：≤1920 宽 + JPEG q82
+    blur = max(0, int(blur))
+    if blur:
+        try:
+            from PIL import Image, ImageFilter
+            img = Image.open(BytesIO(data)).convert("RGB")
+            w, h = img.size
+            pad = blur * 3 + 8                          # 四周复制边缘像素，避免模糊后出现黑边
+            arr = np.pad(np.asarray(img), ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+            out = BytesIO()
+            Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=blur)) \
+                 .crop((pad, pad, pad + w, pad + h)).save(out, format="JPEG", quality=86)
+            data = out.getvalue()
+        except Exception:
+            pass                                        # 没装 Pillow 就不模糊，背景照常显示
+    mime = "image/jpeg" if data[:3] == b"\xff\xd8\xff" else "image/png"
+    return f'data:{mime};base64,{base64.b64encode(data).decode()}'
+
+
 def apply_wallpaper():
     """全局注入背景图（登录页 / 管理员后台 / 成员自助页都生效）。
     滑块值优先取 session_state，做到"边调边看"，保存只是持久化。"""
@@ -1435,29 +1465,29 @@ def apply_wallpaper():
     path = safe_str(cfg.get("path"))
     if not path or not os.path.exists(path):
         return
+    alpha = min(1.0, max(0.0, float(st.session_state.get("wallpaper_alpha", cfg.get("alpha", 0.82)))))
+    blur = max(0, int(st.session_state.get("wallpaper_blur", cfg.get("blur", 0))))
     try:
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
+        uri = _wallpaper_data_uri(path, os.path.getmtime(path), blur)
     except Exception:
         return
-    mime = "image/jpeg" if path.lower().endswith((".jpg", ".jpeg")) else "image/png"
-    alpha = min(1.0, max(0.0, float(st.session_state.get("wallpaper_alpha", cfg.get("alpha", 0.82)))))
-    blur = int(st.session_state.get("wallpaper_blur", cfg.get("blur", 0)))
     st.markdown(f"""
 <style>
-[data-testid="stAppViewContainer"], .stApp {{
-    background-image: url("data:{mime};base64,{b64}");
+/* 背景图已经按 blur 值模糊好，这里只负责铺满；用 !important 盖掉主题白底 */
+.stApp, [data-testid="stAppViewContainer"] {{
+    background-image: url("{uri}") !important;
     background-size: cover;
     background-position: center center;
     background-repeat: no-repeat;
     background-attachment: fixed;
 }}
 [data-testid="stHeader"] {{ background: transparent; }}
-.main .block-container, [data-testid="stAppViewBlockContainer"] {{
+/* 内容区：半透明白底 + 圆角，文字始终清晰（模糊的是背景，不是文字） */
+.main .block-container,
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stMainBlockContainer"] {{
     background: rgba(255,255,255,{alpha:.2f});
     border-radius: 18px;
-    backdrop-filter: blur({blur}px);
-    -webkit-backdrop-filter: blur({blur}px);
     padding: 2rem 2.4rem;
 }}
 </style>
@@ -1947,8 +1977,11 @@ if menu == "管理员后台":
                     _w_alpha = st.slider("内容区不透明度（越大文字越清晰、背景越淡）", 0.30, 1.00,
                                          float(_wcfg.get("alpha", 0.82)), 0.02, key="wallpaper_alpha")
                 with wc2:
-                    _w_blur = st.slider("背景模糊（px，可让文字更易读）", 0, 16,
-                                        int(_wcfg.get("blur", 0)), 1, key="wallpaper_blur")
+                    _w_blur = st.slider("背景模糊（px，越大背景越虚化）", 0, 24,
+                                        int(_wcfg.get("blur", 0)), 1, key="wallpaper_blur",
+                                        help="模糊的是背景图本身，不是内容区，所以文字不会跟着糊。"
+                                             "若觉得变化不明显，多半是上面「不透明度」拉得太高（白底盖住了背景），"
+                                             "把不透明度降到 0.8 以下再拖模糊就明显了。")
                 _w_enabled = st.toggle("启用壁纸", value=bool(_wcfg.get("enabled", False)), key="wallpaper_enabled")
                 _cur_path = safe_str(_wcfg.get("path"))
                 if _cur_path and os.path.exists(_cur_path):
@@ -1975,7 +2008,8 @@ if menu == "管理员后台":
                         st.session_state.pop("wallpaper_enabled", None)
                         st.success("已移除壁纸，恢复默认白色背景")
                         st.rerun()
-                st.caption("说明：拖动滑块会立即预览效果，点「保存壁纸设置」才会持久化（云端重启后仍生效）。"
+                st.caption("说明：松开滑块即预览（模糊由服务器对背景图实时处理，约零点几秒）；"
+                           "点「保存壁纸设置」才会持久化（云端重启后仍生效）。"
                            "壁纸对所有页面生效，包括登录页和成员自助上传页。")
         if st.button("退出登录"):
             st.session_state.login = False
