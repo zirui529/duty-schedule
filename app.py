@@ -1181,7 +1181,9 @@ def smart_schedule(member_list):
     ② 越受限的人越先排：候选按自身可用时段数升序（可选时段少的人优先锁定，把自由的人留到后面）；
     ③ 学员分多轮放开上限（1→2→3 班）：先保证人人有一次班，人不够时再用"确实有空"的人补位；
     ④ 职委按当前班次数升序轮转，天然均衡；
-    ⑤ 绝不违背课表：找不到有空的人时，该班次留空并标记「待人工指派」，不再强制安排有课的人。
+    ⑤ 学员绝不违背课表：排不满的班次留空并标记「待人工指派」；
+       职委优先排无课时段，该时段确实没有空闲职委时，从其余职委里随机抽人兜底
+       （允许有课值班，会在「备注」和告警里逐个标明，方便人工复核调整）。
     """
     stu_pool = [m for m in member_list if safe_str(m.get("role")) == "学员"]
     wei_pool = [m for m in member_list if safe_str(m.get("role")) == "职委"]
@@ -1228,6 +1230,7 @@ def smart_schedule(member_list):
     wei_cand_cnt = {_slot_key(s): sum(1 for m in wei_pool if _slot_key(s) in wei_avail[id(m)]) for s in all_slots}
     wei_order = sorted(all_slots, key=lambda s: (wei_cand_cnt[_slot_key(s)], s["week_idx"], s["shift_idx"]))
     wei_assign = {_slot_key(s): [] for s in all_slots}
+    wei_forced = {_slot_key(s): [] for s in all_slots}   # 该时段没有空闲职委、被随机安排的有课职委
     for slot in wei_order:
         k = _slot_key(slot)
         need = SHIFT_LIST[slot["shift_idx"]]["need_wei"]
@@ -1236,6 +1239,17 @@ def smart_schedule(member_list):
         for m in cands[:need]:
             wei_assign[k].append(m)
             wei_cnt[id(m)] += 1
+        # 兜底：实在没有空闲职委 → 从其余职委里随机抽（tie 是本轮随机序），允许有课值班。
+        # 先按班次数升序再随机：班次最少的职委中随机挑一位，避免某个人被连续兜底。
+        if len(wei_assign[k]) < need and wei_pool:
+            rest = [m for m in wei_pool if not any(id(x) == id(m) for x in wei_assign[k])]
+            rest.sort(key=lambda m: (wei_cnt[id(m)], tie[id(m)]))
+            for m in rest:
+                if len(wei_assign[k]) >= need:
+                    break
+                wei_assign[k].append(m)
+                wei_forced[k].append(m)
+                wei_cnt[id(m)] += 1
 
     # ---------- 组装 + 缺口诊断 ----------
     schedule, pending = [], []
@@ -1254,9 +1268,12 @@ def smart_schedule(member_list):
             else:
                 reasons.append(f"有空学员的排班已达上限（缺{gap_stu}人）")
         if gap_wei:
-            avail_wei = [m for m in wei_pool if k in wei_avail[id(m)]]
-            reasons.append("该时段无职委有空" if not avail_wei else f"职委人数不足（缺{gap_wei}人）")
+            # 职委已有随机兜底，仍缺人只可能是人员库里没有职委（或职委数少于需求）
+            reasons.append("人员库中没有职委" if not wei_pool else f"职委人数不足（缺{gap_wei}人）")
         note = ("待人工指派：" + "；".join(reasons)) if reasons else ""
+        if wei_forced[k]:
+            forced_names = "、".join(safe_str(m.get("name")) for m in wei_forced[k])
+            note = (note + " " if note else "") + f"有课职委兜底：{forced_names}（该时段无空闲职委，已随机安排）"
         if reasons:
             pending.append({"班次": f"{slot['week']}{SHIFT_PERIOD[slot['shift_idx']]}",
                             "缺学员": gap_stu, "缺职委": gap_wei, "原因": "；".join(reasons)})
@@ -1272,9 +1289,17 @@ def smart_schedule(member_list):
     if rested:
         st.info(f"ℹ️ 本周共 {len(rested)} 名学员轮空：{'、'.join(rested)}")
     if pending:
-        st.error(f"⚠️ {len(pending)} 个班次无法在「不违背课表」的前提下排满，已留空标记「待人工指派」"
-                 f"（未自动安排有课人员）。请手动指派后再导出。")
+        st.error(f"⚠️ {len(pending)} 个班次的学员岗无法在「不违背课表」的前提下排满，已留空标记「待人工指派」"
+                 f"（学员不会自动安排有课人员）。请手动指派后再导出。")
         st.dataframe(pd.DataFrame(pending), use_container_width=True)
+    # 职委兜底告警：列出哪些班次安排了有课职委，方便人工复核
+    forced_slots = [s for s in all_slots if wei_forced[_slot_key(s)]]
+    if forced_slots:
+        st.warning(f"⚠️ {len(forced_slots)} 个班次没有空闲职委，已随机安排有课职委兜底值班（职委优先无课时段，"
+                   f"仅在该时段全员有课时才兜底）。如需调整请手动修改。")
+        st.dataframe(pd.DataFrame([{"班次": f"{s['week']}{SHIFT_PERIOD[s['shift_idx']]}",
+                                    "有课职委": "、".join(safe_str(m.get("name")) for m in wei_forced[_slot_key(s)])}
+                                   for s in forced_slots]), use_container_width=True, hide_index=True)
     if stu_pool:
         c = sorted(stu_cnt.values())
         st.caption(f"学员班次分布：共 {sum(c)} 个学员岗，最多 {max(c)} 班 / 最少 {min(c)} 班")
@@ -1805,10 +1830,11 @@ if menu == "管理员后台":
                     st.warning("人员库已清空！")
                     st.rerun()
         with tab3:
-            st.subheader("一键排班（稀缺度优先 + 职委均衡 + 绝不违背课表）")
+            st.subheader("一键排班（稀缺度优先 + 职委均衡 + 学员绝不违背课表）")
             st.caption("策略：可用人数越少的班次越先排（难排的优先）；可选时段越少的人越先锁定；"
-                       "学员先保证每人一班，人不够时才用「确实有空」的人补第二、三班；"
-                       "实在没人可用的班次留空标记「待人工指派」，不会把有课的人硬排上去。")
+                       "学员先保证每人一班，人不够时才用「确实有空」的人补第二、三班，学员岗绝不安排有课人员，"
+                       "排不满的班次留空标记「待人工指派」；"
+                       "职委优先排无课时段，该时段确实没有空闲职委时才随机安排有课职委兜底（会在备注和告警中标明）。")
             mlist = load_members()
             if st.button("生成值班表"):
                 with st.spinner("正在智能排班，综合考虑课表冲突和个性化需求..."):
