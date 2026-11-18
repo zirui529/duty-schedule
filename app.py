@@ -152,6 +152,7 @@ def build_log_record(name, dbg, personal_need=""):
         "cover_rate": round(covered / total, 3) if total else None,
         "ai_agree": dbg.get("ai_agree"),      # True=AI与规则完全一致 False=有差异 None=未比对
         "ai_used": dbg.get("ai_used", True),  # False=批量时关闭了AI（纯规则）
+        "week_slots": len(dbg.get("course_weeks") or {}),  # 成功解析出教学周数的时段数
         "failed": bool(dbg.get("failed")),
         "elapsed_ms": dbg.get("elapsed_ms"),
         "has_personal_need": bool(safe_str(personal_need)),
@@ -240,6 +241,8 @@ def load_members():
             m["role"] = "学员"
         if "phone" not in m:
             m["phone"] = ""
+        if not isinstance(m.get("course_weeks"), dict):
+            m["course_weeks"] = {}
         m["name"] = safe_str(m.get("name"))
     return [m for m in data if isinstance(m, dict) and m.get("name")]
 
@@ -992,19 +995,143 @@ def slot_sort_key(s):
     w = WEEK_NAMES.index(s[:2]) if s[:2] in WEEK_NAMES else 9
     return (w, _SHIFT_ORDER.get(s[2:], 9))
 
+# ========== 课表周数（教学周）确定性解析 ==========
+# 支持两种真实版式：清单式「周数: 3-4周,6-17周」、框线式「课程名(1-2节)3-4周,6-17周/场地...」
+# 以及 第13周 / 3-5周(单) / 4-6周(双) 等写法。解析不到周数一律按「全学期有课」保守处理。
+WEEK_TOKEN_RE = re.compile(
+    r"第?(\d{1,2})\s*(?:[-–—]\s*第?(\d{1,2}))?\s*周(?:\s*[(（](单|双)[)）])?")
+WEEK_NO_MIN, WEEK_NO_MAX = 1, 30
+
+def parse_week_spec(text):
+    """把周数标记解析成周次集合；解析不出返回空集，由调用方按「全学期有课」保守处理。"""
+    out = set()
+    for m in WEEK_TOKEN_RE.finditer(text or ""):
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        tag = m.group(3)
+        for w in range(a, b + 1):
+            if not (WEEK_NO_MIN <= w <= WEEK_NO_MAX):
+                continue
+            if tag == "单" and w % 2 == 0:
+                continue
+            if tag == "双" and w % 2 == 1:
+                continue
+            out.add(w)
+    return out
+
+def _sections_to_periods(sections):
+    """节次集合 → 与之时间重叠的班次索引集合（排班冲突与周数解析共用同一套映射）。"""
+    out = set()
+    for s in sections:
+        if s not in SECTION_TIME:
+            continue
+        c_start, c_end = SECTION_TIME[s]
+        for si, (sh_start, sh_end) in SHIFT_TIME.items():
+            if c_start < sh_end and c_end > sh_start:
+                out.add(si)
+    return out
+
+def format_week_list(weeks):
+    """[3,4,6,...,17] → 「3-4、6-17周」，供界面展示。"""
+    try:
+        vals = sorted({int(x) for x in weeks})
+    except Exception:
+        return ""
+    if not vals:
+        return ""
+    parts, start, prev = [], vals[0], vals[0]
+    for v in vals[1:]:
+        if v == prev + 1:
+            prev = v
+        else:
+            parts.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = v
+    parts.append(f"{start}-{prev}" if start != prev else str(start))
+    return "、".join(parts) + "周"
+
+def parse_course_weeks(table_text, method):
+    """提取「时段 → 有课周次集合」，确定性解析、零AI成本。
+    只有该时段下所有课程条目都解析出周数才写入；任一存疑就不写入，
+    调用方遇缺失即按「全学期有课」保守处理，绝不会误放行。"""
+    lines = [l for l in (table_text or "").splitlines() if l.startswith("|")]
+    if len(lines) < 3:
+        return {}
+
+    def cells_of(line):
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    header = cells_of(lines[0])
+    slot_entries = {}
+
+    def add(wk, secs, weeks):
+        for si in _sections_to_periods(secs):
+            slot_entries.setdefault(f"{wk}{SHIFT_PERIOD[si]}", []).append(weeks)
+
+    sec_pat = re.compile(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*节")
+    if method == "list":
+        wi = next((i for i, h in enumerate(header) if h == "星期"), -1)
+        si = next((i for i, h in enumerate(header) if h == "节次"), -1)
+        di = next((i for i, h in enumerate(header) if h == "详情"), -1)
+        if wi < 0 or si < 0:
+            return {}
+        for line in lines[2:]:
+            c = cells_of(line)
+            c += [""] * (len(header) - len(c))
+            wk = _week_norm(c[wi])
+            if wk not in WEEK_NAMES:
+                continue
+            m = re.fullmatch(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})", c[si])
+            if not m:
+                continue
+            a, b = int(m.group(1)), int(m.group(2))
+            if not (1 <= a <= b <= 13):
+                continue
+            head = (c[di] if di >= 0 else "").split("/")[0]
+            add(wk, set(range(a, b + 1)), parse_week_spec(head))
+    else:
+        week_cols = {i: _week_norm(h) for i, h in enumerate(header)
+                     if _week_norm(h) in WEEK_NAMES}
+        if not week_cols:
+            return {}
+        sec_col = next((i for i, h in enumerate(header) if "节次" in h), -1)
+        for line in lines[2:]:
+            c = cells_of(line)
+            c += [""] * (len(header) - len(c))
+            row_sec = None
+            if sec_col >= 0:
+                m = re.fullmatch(r"(\d{1,2})", c[sec_col])
+                if m:
+                    row_sec = int(m.group(1))
+            for ci, wk in week_cols.items():
+                cell = c[ci] if ci < len(c) else ""
+                if not cell:
+                    continue
+                for entry in cell.split("；"):
+                    if not entry.strip():
+                        continue
+                    weeks = parse_week_spec(entry.split("/")[0])
+                    found = list(sec_pat.finditer(entry))
+                    if found:
+                        for sm in found:
+                            a, b = int(sm.group(1)), int(sm.group(2))
+                            if 1 <= a <= b <= 13:
+                                add(wk, set(range(a, b + 1)), weeks)
+                    elif row_sec:
+                        add(wk, {row_sec}, weeks)
+    result = {}
+    for slot, lst in slot_entries.items():
+        if lst and all(ws for ws in lst):
+            result[slot] = sorted(set().union(*lst))
+    return result
+
 def calc_course_conflict(ai_course_data):
     """把节次映射为班次冲突：只要课程时间与班次时间有重叠，该班次就算不可用
     （例：第9节16:40-17:25 与晚班17:00-20:00重叠 → 下午、晚上都冲突）。"""
     conflict = set()
     for item in ai_course_data:
         w = item["week"]
-        for s in item["sections"]:
-            if s not in SECTION_TIME:
-                continue
-            c_start, c_end = SECTION_TIME[s]
-            for si, (sh_start, sh_end) in SHIFT_TIME.items():
-                if c_start < sh_end and c_end > sh_start:  # 区间相交
-                    conflict.add(f"{w}{SHIFT_PERIOD[si]}")
+        for si in _sections_to_periods(item["sections"]):
+            conflict.add(f"{w}{SHIFT_PERIOD[si]}")
     return sorted(conflict, key=slot_sort_key)
 
 def _in_script_thread():
@@ -1038,9 +1165,19 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
     route = ""
     ai_used = True
     dbg = debug_sink if isinstance(debug_sink, dict) else {}
+    dbg["course_weeks"] = {}   # 默认保守：无周次信息 = 全学期有课
     rule_data, rule_covered, rule_text_cells, rule_partial = [], 0, 0, set()
     ai_agree = None
+    ai_skipped = False
+    rule_complete = False
     raw_ai_count = 0
+    # 课表周数：只从规整表格做确定性解析（图片型/视觉路线没有可靠文本 → 留空走保守）
+    course_weeks = {}
+    if method in ("table", "list"):
+        try:
+            course_weeks = parse_course_weeks(table_text, method)
+        except Exception:
+            course_weeks = {}
     prompt_course = f"""
 下面是课表原文（Markdown表格）。表头行标注了星期几（顺序可能从周日开始，以表头实际标注为准）；有一列是节次编号；节次可能写在单元格内"(X-Y节)"，也可能写成"3-4"这种区间，两种都表示该课占据第X节到第Y节。请提取所有有课的星期和节次，以单元格的星期列位置和节次信息为准：
 {table_text[:12000]}
@@ -1107,6 +1244,10 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
         dbg.update({"route": route, "method": method, "failed": True, "ai_used": ai_used,
                     "elapsed_ms": int((time.time() - t0) * 1000)})
         return f"课表识别失败:{str(e)[:60]}"
+    # 周数可信度闸门：只有规整表格 + 规则解析 100% 覆盖 + 没走视觉读图时，才敢按周数放行。
+    # 否则 AI 可能在同一个时段补出规则没读到的课，放行就会误排 —— 这种情况整份课表按全学期保守处理。
+    if rule_complete and "视觉路线" not in route:
+        dbg["course_weeks"] = {k: v for k, v in course_weeks.items() if k in course_conflict}
     # ---- 识别详情：收集到 debug_sink（批量线程）或在线程内直接渲染 ----
     dbg.update({
         "route": route,
@@ -1128,6 +1269,10 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                 st.caption(f"规则解析（确定性）：{len(rule_data)} 个星期，节次覆盖 {rule_covered}/{rule_text_cells}"
                            + (f"，AI与规则一致：{'是' if ai_agree else '否'}" if ai_agree is not None else ""))
                 st.code(json.dumps(ai_course_data, ensure_ascii=False, indent=2), language="json")
+                if dbg.get("course_weeks"):
+                    st.caption(f"课表周数解析：{len(dbg['course_weeks'])} 个时段（仅列出有课周次，其余按全学期保守）")
+                    st.code(json.dumps({k: format_week_list(v) for k, v in dbg["course_weeks"].items()},
+                                       ensure_ascii=False, indent=2), language="json")
                 if dbg["table_text"]:
                     with st.expander("📄 查看喂给AI的课表表格（核对是否错位）"):
                         st.text(dbg["table_text"])
@@ -1150,6 +1295,10 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                     st.caption("说明：AI输出的每条时段都必须能在你的原话里找到逐字依据，找不到依据的会被自动丢弃。")
             except Exception:
                 pass
+    # 个性化需求是「每周都不值班」，不受教学周影响，从周数豁免里剔除
+    if personal_slots and dbg.get("course_weeks"):
+        dbg["course_weeks"] = {k: v for k, v in dbg["course_weeks"].items()
+                               if k not in set(personal_slots)}
     total = sorted(set(course_conflict + personal_slots), key=slot_sort_key)
     if not total:
         dbg["failed"] = True
@@ -1157,26 +1306,58 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
     return "、".join(total)
 
 # ========== 判断某人在某时段是否有空 ==========
-def is_available(member, week_idx, shift_idx):
+def _normalize_week_range(value):
+    """把排班周次参数统一成 (起, 止)；None 表示不按周判断（旧行为）。单周 int 视为 (n, n)。"""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            a, b = int(value[0]), int(value[1])
+            return (min(a, b), max(a, b))
+        n = int(value)
+        return (n, n)
+    except (TypeError, ValueError):
+        return None
+
+def is_available(member, week_idx, shift_idx, week_range=None):
+    """判断某人在某时段是否有空。
+    week_range 为本次排班覆盖的教学周次（单周 int 或 (起,止) 区间）：
+    课表标注了上课周次的时段，若所选区间内该课一周都不上，则视为可排；
+    区间内任意一周有课仍然禁排。没写周数、周数解析失败或老数据一律按「全学期有课」保守处理。
+    None 时行为与旧版完全一致（全部按全学期占用）。"""
     class_conflict = safe_str(member.get("class_conflict"))
     week_name = WEEK_NAMES[week_idx]
     period = SHIFT_PERIOD[shift_idx]
     conflict_str = f"{week_name}{period}"
     if class_conflict and class_conflict != "无" and conflict_str in class_conflict:
+        rng = _normalize_week_range(week_range)
+        if rng is not None:
+            cw = member.get("course_weeks")
+            if isinstance(cw, dict):
+                weeks = cw.get(conflict_str)
+                if isinstance(weeks, (list, tuple, set)):
+                    try:
+                        busy = {int(x) for x in weeks}
+                        if not any(w in busy for w in range(rng[0], rng[1] + 1)):
+                            return True   # 所选周次内这门课都不上 → 可以排班
+                    except (TypeError, ValueError):
+                        pass
         return False
     return True
 
 # ========== 智能排班（稀缺度优先 + 均衡 + 绝不违背课表） ==========
-def _available_slot_keys(member):
-    """该成员本周可以值班的 (week_idx, shift_idx) 集合。"""
+def _available_slot_keys(member, week_range=None):
+    """该成员本次排班可以值班的 (week_idx, shift_idx) 集合。"""
     return {(w, s) for w in range(len(WEEK_NAMES)) for s in range(len(SHIFT_LIST))
-            if is_available(member, w, s)}
+            if is_available(member, w, s, week_range)}
 
 def _slot_key(slot):
     return (slot["week_idx"], slot["shift_idx"])
 
-def smart_schedule(member_list):
+def smart_schedule(member_list, week_range=None):
     """排班策略：
+    ⓪ 按所选教学周区间分析：区间内任意一周有课的时段禁排；整个区间都不上的课放行；
+       未标注周数/老数据按全学期有课保守处理；
     ① 稀缺度优先：可用人数越少的班次越先排，避免"好排的时段先把稀缺人员抢光、难排的时段最后没人"；
     ② 越受限的人越先排：候选按自身可用时段数升序（可选时段少的人优先锁定，把自由的人留到后面）；
     ③ 学员分多轮放开上限（1→2→3 班）：先保证人人有一次班，人不够时再用"确实有空"的人补位；
@@ -1185,9 +1366,15 @@ def smart_schedule(member_list):
        职委优先排无课时段，该时段确实没有空闲职委时，从其余职委里随机抽人兜底
        （允许有课值班，会在「备注」和告警里逐个标明，方便人工复核调整）。
     """
+    rng = _normalize_week_range(week_range)
     stu_pool = [m for m in member_list if safe_str(m.get("role")) == "学员"]
     wei_pool = [m for m in member_list if safe_str(m.get("role")) == "职委"]
     st.info(f"📊 人员统计：学员 {len(stu_pool)} 人，职委 {len(wei_pool)} 人")
+    if rng is not None:
+        _wk_members = [m for m in member_list if isinstance(m.get("course_weeks"), dict) and m["course_weeks"]]
+        _span = f"第 {rng[0]} 周" if rng[0] == rng[1] else f"第 {rng[0]} ~ {rng[1]} 周（共 {rng[1]-rng[0]+1} 周）"
+        st.info(f"📅 本次排班：{_span}｜{len(_wk_members)} 人带有课表周数，"
+                f"仅当所选区间内确实有课才禁排；其余人员按全学期有课保守处理。")
     if len(wei_pool) == 0:
         st.error("⚠️ 警告：人员库里没有职委！请去「人员库管理」把需要当职委的人身份改成「职委」")
     if not stu_pool:
@@ -1202,7 +1389,7 @@ def smart_schedule(member_list):
     tie = {id(m): random.random() for m in stu_pool + wei_pool}   # 同分时随机打破平局（每次排班不完全相同）
 
     # ---------- 学员 ----------
-    stu_avail = {id(m): _available_slot_keys(m) for m in stu_pool}
+    stu_avail = {id(m): _available_slot_keys(m, rng) for m in stu_pool}
     stu_cnt = {id(m): 0 for m in stu_pool}
     # 每个班次有多少学员可选 → 稀缺度（人数越少越难排，必须最先满足）
     cand_cnt = {_slot_key(s): sum(1 for m in stu_pool if _slot_key(s) in stu_avail[id(m)]) for s in all_slots}
@@ -1225,7 +1412,7 @@ def smart_schedule(member_list):
                 stu_cnt[id(m)] += 1
 
     # ---------- 职委 ----------
-    wei_avail = {id(m): _available_slot_keys(m) for m in wei_pool}
+    wei_avail = {id(m): _available_slot_keys(m, rng) for m in wei_pool}
     wei_cnt = {id(m): 0 for m in wei_pool}
     wei_cand_cnt = {_slot_key(s): sum(1 for m in wei_pool if _slot_key(s) in wei_avail[id(m)]) for s in all_slots}
     wei_order = sorted(all_slots, key=lambda s: (wei_cand_cnt[_slot_key(s)], s["week_idx"], s["shift_idx"]))
@@ -1280,6 +1467,7 @@ def smart_schedule(member_list):
         schedule.append({
             "week_idx": slot["week_idx"], "shift_idx": slot["shift_idx"],
             "week": slot["week"], "shift": slot["shift"],
+            "week_start": rng[0] if rng else None, "week_end": rng[1] if rng else None,
             "学员": stu_list, "职委": wei_list,
             "缺口": gap_stu + gap_wei, "备注": note,
         })
@@ -1320,7 +1508,15 @@ def export_pdf_auto(schedule_data, template_name):
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
     c.setFont(FONT_NAME, 14)
-    c.drawCentredString(w/2, h-40, "武汉大学学生会值班表")
+    _ws = schedule_data[0].get("week_start") if schedule_data else None
+    _we = schedule_data[0].get("week_end") if schedule_data else None
+    if _ws and _we and _ws != _we:
+        _label = f"（第 {_ws}-{_we} 周）"
+    elif _ws:
+        _label = f"（第 {_ws} 周）"
+    else:
+        _label = ""
+    c.drawCentredString(w/2, h-40, "武汉大学学生会值班表" + _label)
     y = h - 70
     if template_name == "武汉大学学生会水印模板":
         c.setFillColorRGB(0.85,0.85,0.85)
@@ -1708,6 +1904,10 @@ if menu == "管理员后台":
                             # 记录识别异常人员，rerun后在页面上方提示人工核对
                             st.session_state.ai_failed_names = [safe_str(r.get("name")) for r in current_rows if is_recognize_failed(r.get("class_conflict"))]
                             st.session_state.temp_debug = {safe_str(current_rows[i].get("name")): dbg_map.get(i, {}) for i in need_ai_idx}
+                            _wk_map = st.session_state.get("temp_week_map", {})
+                            _wk_map.update({safe_str(current_rows[i].get("name")): (dbg_map.get(i, {}) or {}).get("course_weeks") or {}
+                                            for i in need_ai_idx})
+                            st.session_state.temp_week_map = _wk_map
                             st.session_state.temp_new_member = current_rows
                             # ---- 写入识别质量日志（主线程统一写，避免多线程争抢文件） ----
                             try:
@@ -1742,6 +1942,7 @@ if menu == "管理员后台":
                             if is_recognize_failed(row["class_conflict"]):
                                 skipped.append(nm)
                                 continue
+                            row["course_weeks"] = st.session_state.get("temp_week_map", {}).get(nm, {})
                             new_add.append(row)
                         all_mem.extend(new_add)
                         save_members(all_mem)
@@ -1754,6 +1955,7 @@ if menu == "管理员后台":
                             st.session_state.temp_pdf_bytes = []
                             st.session_state.temp_pdf_by_name = {}
                             st.session_state.temp_debug = {}
+                            st.session_state.temp_week_map = {}
                             st.success(f"成功录入 {len(new_add)} 人！")
                             st.rerun()
                 with col_c:
@@ -1792,7 +1994,7 @@ if menu == "管理员后台":
                                      use_container_width=True, hide_index=True)
                     _df_log = pd.DataFrame(_log[-100:])[::-1]
                     _show_cols = [c for c in ["time", "name", "method", "route_type", "cover_rate",
-                                              "ai_agree", "ai_used", "failed", "elapsed_ms"] if c in _df_log.columns]
+                                              "ai_agree", "ai_used", "week_slots", "failed", "elapsed_ms"] if c in _df_log.columns]
                     st.caption("最近 100 条明细（倒序）")
                     st.dataframe(_df_log[_show_cols], use_container_width=True, hide_index=True)
                     _csv = pd.DataFrame(_log).to_csv(index=False).encode("utf-8-sig")
@@ -1802,7 +2004,11 @@ if menu == "管理员后台":
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
             mem = load_members()
-            df = pd.DataFrame(mem)
+            # 周次明细是结构化字典：不放进可编辑表格（会被当成文本列覆盖丢失），按姓名单独保管
+            week_map = {safe_str(m.get("name")): m["course_weeks"]
+                        for m in mem if isinstance(m.get("course_weeks"), dict) and m["course_weeks"]}
+            disp_mem = [{k: v for k, v in m.items() if k != "course_weeks"} for m in mem]
+            df = pd.DataFrame(disp_mem)
             df.insert(0, "序号", range(1, len(df)+1))
             edit_config = {
                 "序号": st.column_config.NumberColumn("序号", disabled=True),
@@ -1821,27 +2027,61 @@ if menu == "管理员后台":
                             row["personal_need"] = safe_str(row.get("personal_need"))
                             row["class_conflict"] = safe_str(row.get("class_conflict"))
                             row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
+                            row["course_weeks"] = week_map.get(safe_str(row.get("name")), {})
                         save_members(records)
                     st.success("已保存人员库！")
                     st.rerun()
             with col2:
                 if st.button("🗑️一键清空全部人员"):
                     save_members([])
+                    st.session_state.temp_week_map = {}
                     st.warning("人员库已清空！")
                     st.rerun()
+            _wk_rows = []
+            for _m in mem:
+                _cw = _m.get("course_weeks")
+                if not isinstance(_cw, dict) or not _cw:
+                    continue
+                for _slot, _wks in sorted(_cw.items(), key=lambda kv: slot_sort_key(kv[0])):
+                    _wk_rows.append({"姓名": safe_str(_m.get("name")), "时段": _slot,
+                                     "有课周次": format_week_list(_wks)})
+            with st.expander(f"📅 课表周次明细（{len(week_map)} 人已识别，只读）"):
+                st.caption("仅当所选排班周次区间与「有课周次」有交集时，该时段才禁排；"
+                           "没有周次信息的人员与时段一律按全学期有课保守处理。"
+                           "在上方修改「不能值班时段」不会清除这里的周次数据。")
+                if _wk_rows:
+                    st.dataframe(pd.DataFrame(_wk_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("当前人员库还没有周次信息。重新上传课表即可自动识别（老数据保持全学期保守，不会误排）。")
         with tab3:
-            st.subheader("一键排班（稀缺度优先 + 职委均衡 + 学员绝不违背课表）")
-            st.caption("策略：可用人数越少的班次越先排（难排的优先）；可选时段越少的人越先锁定；"
+            st.subheader("一键排班（按所选教学周 + 稀缺度优先 + 职委均衡 + 学员绝不违背课表）")
+            st.caption("策略：先按你选的周次区间分析课程——区间内任意一周有课的时段禁排，"
+                       "整段都不上的课不再占用；可用人数越少的班次越先排；可选时段越少的人越先锁定；"
                        "学员先保证每人一班，人不够时才用「确实有空」的人补第二、三班，学员岗绝不安排有课人员，"
                        "排不满的班次留空标记「待人工指派」；"
                        "职委优先排无课时段，该时段确实没有空闲职委时才随机安排有课职委兜底（会在备注和告警中标明）。")
+            week_span = st.slider(
+                "选择本次排班覆盖的教学周次（起 ~ 止）",
+                min_value=WEEK_NO_MIN, max_value=WEEK_NO_MAX,
+                value=(WEEK_NO_MIN, 18), step=1, key="schedule_week_span",
+                help="按所选区间内的课程分析：区间里任意一周有课的时段禁排；"
+                     "该课在整个区间都不上（已结课或尚未开课）则不再占用，可以排班。"
+                     "只排一周就把起止选成同一个数。")
+            wk_start, wk_end = int(week_span[0]), int(week_span[1])
+            st.caption(f"📅 本次排班：第 {wk_start} 周"
+                       + (f" ~ 第 {wk_end} 周（共 {wk_end - wk_start + 1} 周）" if wk_end != wk_start else "")
+                       + "｜按该区间内的课程分析，选完请点「生成值班表」。")
             mlist = load_members()
             if st.button("生成值班表"):
-                with st.spinner("正在智能排班，综合考虑课表冲突和个性化需求..."):
-                    result = smart_schedule(mlist)
+                with st.spinner("正在智能排班，按所选周次区间分析课程冲突..."):
+                    result = smart_schedule(mlist, (wk_start, wk_end))
                     st.session_state.schedule_result = result
                 st.success("排班完成！")
             if st.session_state.schedule_result:
+                _r0 = st.session_state.schedule_result[0]
+                _rs, _re = _r0.get("week_start"), _r0.get("week_end")
+                if _rs:
+                    st.caption("当前结果对应：" + (f"第 {_rs} ~ {_re} 周" if _re and _re != _rs else f"第 {_rs} 周"))
                 _disp = []
                 for _row in st.session_state.schedule_result:
                     _disp.append({
@@ -2072,6 +2312,7 @@ elif menu == "成员自助上传":
                     "phone": safe_str(phone),
                     "role": role_sel,
                     "class_conflict": class_conflict,
+                    "course_weeks": _m_sink.get("course_weeks") or {},
                     "personal_need": safe_str(limit_input),
                 }
                 st.rerun()
@@ -2085,6 +2326,10 @@ elif menu == "成员自助上传":
             value=pending["class_conflict"], height=100,
             key=f"member_confirm_{pending['name']}_{abs(hash(pending['class_conflict'])) % 100000}")
         st.caption(f"提交人：{pending['name']} ｜ 电话：{pending['phone']} ｜ 身份：{pending['role']}")
+        _mweek = pending.get("course_weeks") or {}
+        if _mweek:
+            st.caption(f"📅 已识别 {len(_mweek)} 个时段的上课周次，这些时段只在对应教学周禁排，"
+                       "其余周次可以排班（明细由管理员在「人员库管理 → 课表周次明细」查看）。")
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ 确认无误，提交入库"):
@@ -2104,6 +2349,7 @@ elif menu == "成员自助上传":
                             m["phone"] = pending["phone"]
                             m["role"] = pending["role"]
                             m["class_conflict"] = final_conflict
+                            m["course_weeks"] = pending.get("course_weeks") or {}
                             m["personal_need"] = pending["personal_need"]
                             exist = True
                     if conflict_owner is not None:
@@ -2111,7 +2357,9 @@ elif menu == "成员自助上传":
                     else:
                         if not exist:
                             all_mem.append({"name": pending["name"], "phone": pending["phone"], "role": pending["role"],
-                                            "class_conflict": final_conflict, "personal_need": pending["personal_need"]})
+                                            "class_conflict": final_conflict,
+                                            "course_weeks": pending.get("course_weeks") or {},
+                                            "personal_need": pending["personal_need"]})
                         save_members(all_mem)
                         st.session_state.member_pending = None
                         st.success("提交成功！管理员已能看到你的不能值班时段。")
