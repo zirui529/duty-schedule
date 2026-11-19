@@ -1539,58 +1539,230 @@ def export_pdf_auto(schedule_data, template_name):
     return buf
 
 # ========== 模式B：填充用户模板 ==========
-def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset_y:int=-30, cell_w:int=82, cell_h:int=115):
-    doc = fitz.open(stream=template_bytes, filetype="pdf")
-    page = doc[0]
-    start_x = 158 + offset_x
-    start_y = 175 + offset_y
-    font_title = 6
-    font_name = 6
-    font_phone = 4.5
-    gap_title = 5
-    gap_name = 4.5
-    gap_phone = 4
-    cell_dict = {}
-    for si in range(3):
-        for wi in range(7):
-            cell_dict[(si,wi)] = {"stu":[], "wei":[]}
+# 新版式参数（由官方填写样例反推）：填充文字统一字号、姓名/手机行距固定
+_DUTY_SIZE = 11.1
+_DUTY_MIN_SIZE = 7.5
+_DUTY_LINE = 15.1          # 姓名/手机两行行距（pt）
+_DAY_ORDER = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+try:
+    _FONT_CJK = fitz.Font("china-s")
+    _FONT_LATIN = fitz.Font("helv")
+except Exception:
+    _FONT_CJK = None
+    _FONT_LATIN = None
+
+def _text_w(text, sz):
+    """按内置中文字体测量文字宽度；字体不可用时按 CJK/ASCII 估算。"""
+    if _FONT_CJK is not None:
+        return _FONT_CJK.text_length(text, fontsize=sz)
+    return sum(sz if ord(ch) > 0x2E80 else sz * 0.52 for ch in str(text))
+
+def _text_w_latin(text, sz):
+    """手机号等纯数字用 Helvetica 测宽（china-s 对 ASCII 渲染间距异常，不用它写数字）。"""
+    if _FONT_LATIN is not None:
+        return _FONT_LATIN.text_length(text, fontsize=sz)
+    return sum(sz * (0.55 if ch.isdigit() else 0.52) for ch in str(text))
+
+def _page_spans(page):
+    out = []
+    for b in page.get_text("dict")["blocks"]:
+        if b.get("type") != 0:
+            continue
+        for l in b["lines"]:
+            for s in l["spans"]:
+                t = s["text"].strip()
+                if t:
+                    out.append({"bbox": s["bbox"], "size": s["size"], "text": t})
+    return out
+
+def _detect_duty_template(page):
+    """新版值班表布局探测（纯文字锚点，不依赖表格线）：
+    ① 表头一排「星期X」→ 7 个列中心；② 左侧窄列「值班/学员」「轮值/职委」
+    按 y 聚类成 3 个时段 → 学员子行/职委子行的 y 中心；③ 标题里的日期占位串。
+    返回 {"cols_x", "zones", "title"}；探测不到新式结构时返回 None（走旧网格兜底）。"""
+    try:
+        sp = _page_spans(page)
+        day_pat = re.compile(r"^(星期|周)[一二三四五六日天]$")
+        days = [s for s in sp if day_pat.match(s["text"])]
+        if len(days) < 7:
+            return None
+        top_y = min(s["bbox"][1] for s in days)
+        days = [s for s in days if s["bbox"][1] < top_y + 20]
+        if len(days) < 7:
+            return None
+        days.sort(key=lambda s: _DAY_ORDER.get(s["text"][-1], 0))
+        cols_x = [(s["bbox"][0] + s["bbox"][2]) / 2 for s in days]
+        x_limit = min(cols_x) - 20
+        stu_tags = [s for s in sp if s["bbox"][0] < x_limit and s["text"] in ("值班", "学员")]
+        wei_tags = [s for s in sp if s["bbox"][0] < x_limit and s["text"] in ("轮值", "职委")]
+        if not stu_tags or not wei_tags:
+            return None
+
+        def _cluster(items):
+            items = sorted(items, key=lambda s: s["bbox"][1])
+            groups, cur = [], [items[0]]
+            for s in items[1:]:
+                if s["bbox"][1] - cur[-1]["bbox"][1] < 30:
+                    cur.append(s)
+                else:
+                    groups.append(cur)
+                    cur = [s]
+            groups.append(cur)
+            return groups
+        stu_g, wei_g = _cluster(stu_tags), _cluster(wei_tags)
+        if len(stu_g) != 3 or len(wei_g) != 3:
+            return None
+        zones = []
+        for g1, g2 in zip(stu_g, wei_g):
+            stu_cy = (min(s["bbox"][1] for s in g1) + max(s["bbox"][3] for s in g1)) / 2
+            wei_cy = (min(s["bbox"][1] for s in g2) + max(s["bbox"][3] for s in g2)) / 2
+            zones.append((stu_cy, wei_cy))
+        title = next((s for s in sp if s["bbox"][1] < 105
+                      and re.fullmatch(r"[\dXx.\-—–\s]{5,}", s["text"])
+                      and re.search(r"[\dXx]", s["text"])), None)
+        return {"cols_x": cols_x, "zones": zones, "title": title}
+    except Exception:
+        return None
+
+def _fit_person_block(name, phone, max_w):
+    """一个人的姓名+手机整理成统一字号的行列表（与填写样例一致）：
+    姓名仅允许轻微缩小（不低于 9.5pt）保持单行；再超宽就按「·」或中点拆两行后微调字号。"""
+    def shrink(text, start, floor):
+        s = start
+        while s > floor and _text_w(text, s) > max_w:
+            s -= 0.5
+        return s
+    sz = shrink(name, _DUTY_SIZE, 9.5)
+    if _text_w(name, sz) <= max_w:
+        lines = [name]
+    else:
+        cut = name.find("·")
+        mid = cut + 1 if 0 < cut < len(name) - 1 else (len(name) + 1) // 2
+        lines = [name[:mid], name[mid:]]
+        sz = shrink(lines[0], _DUTY_SIZE, _DUTY_MIN_SIZE)
+        while sz > _DUTY_MIN_SIZE and _text_w(lines[1], sz) > max_w:
+            sz -= 0.5
+    if phone:
+        def shrink_latin(text, start, floor):
+            s = start
+            while s > floor and _text_w_latin(text, s) > max_w:
+                s -= 0.5
+            return s
+        p_sz = shrink_latin(str(phone), sz, _DUTY_MIN_SIZE)
+        lines.append(str(phone))
+        sz = min(sz, p_sz)
+    return lines, sz
+
+def _insert_person(page, cx, block_cy, name, phone, max_w):
+    """在 (cx, block_cy) 块中心居中写入一个人的姓名+手机（行距固定，样例样式）。
+    姓名用内置中文字体，手机号用 Helvetica（数字渲染更接近官方样例且不跨列）。"""
+    lines, sz = _fit_person_block(name, phone, max_w)
+    n = len(lines)
+    for i, text in enumerate(lines):
+        is_phone = phone and text == str(phone)
+        w = _text_w_latin(text, sz) if is_phone else _text_w(text, sz)
+        baseline = block_cy + (i - (n - 1) / 2) * _DUTY_LINE + sz * 0.35
+        page.insert_text((cx - w / 2, baseline), text, fontsize=sz,
+                         fontname="helv" if is_phone else "china-s", color=(0, 0, 0))
+
+def _fill_anchored(page, layout, schedule_data, offset_x, offset_y, start_date, end_date):
+    """新版式填充：学员子行上下两半各 1 人、职委子行 1 人，全部居中；
+    标题日期占位（2026.X.X-2026.X.X）替换为实际值班周期。"""
+    cols_x = layout["cols_x"]
+    gaps = [cols_x[i + 1] - cols_x[i] for i in range(len(cols_x) - 1)] or [96]
+    max_w = min(gaps) * 0.88
+    cell_dict = {(si, wi): {"stu": [], "wei": []} for si in range(3) for wi in range(7)}
     for entry in schedule_data:
         k = (entry["shift_idx"], entry["week_idx"])
         if k in cell_dict:
             for p in entry["学员"]:
-                cell_dict[k]["stu"].append( (p["name"], p.get("phone","")) )
+                cell_dict[k]["stu"].append((safe_str(p.get("name")), safe_str(p.get("phone"))))
             for p in entry["职委"]:
-                cell_dict[k]["wei"].append( (p["name"], p.get("phone","")) )
-    total_block_height = gap_title + gap_name + gap_phone + gap_name + gap_phone + gap_title + gap_name + gap_phone
-    top_pad = (cell_h - total_block_height) // 2
-    for shift_idx in range(3):
-        for week_idx in range(7):
-            cell_data = cell_dict[(shift_idx, week_idx)]
-            stu_list = cell_data["stu"][0:2]
-            wei_list = cell_data["wei"][0:1]
-            pos_x = start_x + week_idx * cell_w + 5
-            pos_y = start_y + shift_idx * cell_h + top_pad
-            cy = pos_y
-            page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
-            cy += gap_title
-            for name, phone in stu_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
-                cy += gap_name
-                if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
-                    cy += gap_phone
-                else:
+                cell_dict[k]["wei"].append((safe_str(p.get("name")), safe_str(p.get("phone"))))
+    for si, (stu_cy, wei_cy) in enumerate(layout["zones"]):
+        half = (wei_cy - stu_cy) * 2 / 3   # 学员子行内上下两半的中心距（由样例反推）
+        for wi in range(7):
+            cx = cols_x[wi] + offset_x
+            data = cell_dict[(si, wi)]
+            stu = data["stu"][:2]
+            for j, half_dy in ((0, -half / 2), (1, half / 2)):
+                if j < len(stu):
+                    _insert_person(page, cx, stu_cy + offset_y + half_dy, stu[j][0], stu[j][1], max_w)
+            if data["wei"]:
+                _insert_person(page, cx, wei_cy + offset_y, data["wei"][0][0], data["wei"][0][1], max_w)
+    title = layout.get("title")
+    if title and start_date and end_date:
+        try:
+            rect = fitz.Rect(title["bbox"])
+            sz = title["size"]
+            page.add_redact_annot(rect)
+            page.apply_redactions()
+            text = (f"{int(start_date.year)}.{int(start_date.month):02d}.{int(start_date.day):02d}"
+                    f"-{int(end_date.year)}.{int(end_date.month):02d}.{int(end_date.day):02d}")
+            page.insert_text((rect.x0, rect.y1 - sz * 0.25), text, fontsize=sz,
+                             fontname="tibo", color=(0, 0, 0))
+        except Exception:
+            pass
+
+def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset_y:int=-30, cell_w:int=82, cell_h:int=115,
+                           start_date=None, end_date=None):
+    doc = fitz.open(stream=template_bytes, filetype="pdf")
+    page = doc[0]
+    layout = _detect_duty_template(page)
+    if layout is not None:
+        # 新版式：文字锚点自动定位，无需手动微调单元格尺寸
+        _fill_anchored(page, layout, schedule_data, offset_x, offset_y, start_date, end_date)
+    else:
+        # 旧版固定网格（老模板兜底，行为与历史版本一致）
+        start_x = 158 + offset_x
+        start_y = 175 + offset_y
+        font_title = 6
+        font_name = 6
+        font_phone = 4.5
+        gap_title = 5
+        gap_name = 4.5
+        gap_phone = 4
+        cell_dict = {}
+        for si in range(3):
+            for wi in range(7):
+                cell_dict[(si,wi)] = {"stu":[], "wei":[]}
+        for entry in schedule_data:
+            k = (entry["shift_idx"], entry["week_idx"])
+            if k in cell_dict:
+                for p in entry["学员"]:
+                    cell_dict[k]["stu"].append( (p["name"], p.get("phone","")) )
+                for p in entry["职委"]:
+                    cell_dict[k]["wei"].append( (p["name"], p.get("phone","")) )
+        total_block_height = gap_title + gap_name + gap_phone + gap_name + gap_phone + gap_title + gap_name + gap_phone
+        top_pad = (cell_h - total_block_height) // 2
+        for shift_idx in range(3):
+            for week_idx in range(7):
+                cell_data = cell_dict[(shift_idx, week_idx)]
+                stu_list = cell_data["stu"][0:2]
+                wei_list = cell_data["wei"][0:1]
+                pos_x = start_x + week_idx * cell_w + 5
+                pos_y = start_y + shift_idx * cell_h + top_pad
+                cy = pos_y
+                page.insert_text((pos_x, cy), "值班学员", fontsize=font_title, fontname="china-s")
+                cy += gap_title
+                for name, phone in stu_list:
+                    page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                     cy += gap_name
-            page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
-            cy += gap_title
-            for name, phone in wei_list:
-                page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
-                cy += gap_name
-                if phone:
-                    page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
-                    cy += gap_phone
-                else:
+                    if phone:
+                        page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                        cy += gap_phone
+                    else:
+                        cy += gap_name
+                page.insert_text((pos_x, cy), "轮值职委", fontsize=font_title, fontname="china-s")
+                cy += gap_title
+                for name, phone in wei_list:
+                    page.insert_text((pos_x, cy), name, fontsize=font_name, fontname="china-s")
                     cy += gap_name
+                    if phone:
+                        page.insert_text((pos_x, cy), str(phone), fontsize=font_phone, fontname="china-s")
+                        cy += gap_phone
+                    else:
+                        cy += gap_name
     out_buf = BytesIO()
     doc.save(out_buf)
     doc.close()
@@ -2108,15 +2280,21 @@ if menu == "管理员后台":
                             pdf_buf = export_pdf_auto(st.session_state.schedule_result, pdf_template_sel)
                         st.download_button("下载值班表", pdf_buf, file_name="值班表.pdf", mime="application/pdf")
             else:
-                st.info("上传你自己的空白值班表PDF模板，文字块整体缩小居中")
+                st.info("上传你自己的空白值班表PDF模板，系统自动识别表格位置并按版式填充（值班学员 / 轮值职委分区写入）")
                 user_up = st.file_uploader("上传你的空白值班表PDF模板", type="pdf")
                 if user_up:
                     st.session_state.user_template_bytes = user_up.read()
                     st.success("模板已加载！")
+                _dc1, _dc2 = st.columns(2)
+                with _dc1:
+                    _tpl_start = st.date_input("值班周期起始日期（选填）", value=None)
+                with _dc2:
+                    _tpl_end = st.date_input("值班周期结束日期（选填）", value=None)
+                st.caption("两个日期都填写后，模板标题中的「2026.X.X-2026.X.X」会替换为实际周期；留空则保持模板原样。")
                 off_x = st.number_input("横向微调偏移", value=0)
-                off_y = st.number_input("纵向微调偏移", value=-30)
-                cw = st.number_input("单元格宽度（不同模板需要微调）", value=82, min_value=20, max_value=300)
-                ch = st.number_input("单元格高度（不同模板需要微调）", value=115, min_value=20, max_value=300)
+                off_y = st.number_input("纵向微调偏移", value=0)
+                cw = st.number_input("单元格宽度（仅旧版模板需要）", value=82, min_value=20, max_value=300)
+                ch = st.number_input("单元格高度（仅旧版模板需要）", value=115, min_value=20, max_value=300)
                 if not st.session_state.schedule_result:
                     st.warning("请先生成排班结果")
                 elif not st.session_state.user_template_bytes:
@@ -2125,7 +2303,8 @@ if menu == "管理员后台":
                     if st.button("自动填充我的模板并导出"):
                         with st.spinner("正在填充你的模板PDF..."):
                             out_buf = fill_user_template_pdf(st.session_state.user_template_bytes, st.session_state.schedule_result,
-                                                             int(off_x), int(off_y), int(cw), int(ch))
+                                                             int(off_x), int(off_y), int(cw), int(ch),
+                                                             _tpl_start, _tpl_end)
                         st.download_button("下载填充好的值班表", out_buf, file_name="值班表_已填充.pdf", mime="application/pdf")
         with tab5:
             st.subheader("分享自助提交链接")
