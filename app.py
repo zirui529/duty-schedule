@@ -1,3 +1,9 @@
+"""值班排班系统 · Streamlit 单文件应用。
+
+成员上传教务课表 PDF → 规则解析与 AI 双通道识别「不能值班时段」及上课周次 → 按所选教学周区间排班 → 导出 PDF。
+人员与账号数据落应用目录 JSON，模型密钥走 st.secrets，界面文案为中文。
+"""
+
 import streamlit as st
 import fitz
 import pandas as pd
@@ -23,15 +29,10 @@ from dashscope import MultiModalConversation
 import numpy as np
 import pdfplumber
 
-# ========== 基础配置 ==========
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PWD = "123456"
 DATA_FILE = "member_data.json"
 ADMIN_FILE = "admin_info.json"
-# -------- 分工 --------
-# 课表识别主路线：qwen-vl-max 视觉模型直接看课表图片（最准，绕过文本坐标解析）
-# 课表识别备选：规整表格文本 + qwen-plus 文本模型（有清晰表格线时使用，快且省）
-# doubao2.1‑seed‑pro 火山chat：个性化需求解析
 COURSE_TEXT_MODEL = "qwen-plus"
 COURSE_VL_MODEL = "qwen-vl-max-latest"
 try:
@@ -65,8 +66,6 @@ def safe_str(val):
         return ""
     return str(val).strip()
 
-# ========== 识别结果失败判定 & 规范化（管理员上传 / 成员自助上传 两条路径共用） ==========
-# 注意：批量识别线程异常时写的是"识别失败: ..."，必须一并拦截，否则会当作有效数据入库
 FAIL_PREFIXES = ("课表识别失败", "识别失败", "识别为空", "课表文本提取失败")
 
 def is_recognize_failed(text):
@@ -79,7 +78,6 @@ def normalize_conflict_text(text):
     valid = {t.strip() for t in tokens if t.strip() in ALL_SLOTS}
     return "、".join(sorted(valid, key=slot_sort_key))
 
-# ========== 管理员文件读写 ==========
 def _atomic_write_json(path, data):
     """原子写入：先写临时文件再替换，避免进程中断把JSON写坏（写坏的JSON会让应用启动即崩）。"""
     tmp = path + ".tmp"
@@ -103,10 +101,8 @@ def _safe_load_json(path, default):
             pass
         return default
 
-# ========== 识别质量日志（可观测：路线 / 规则覆盖率 / AI一致性 / 耗时） ==========
-# 目的：累积后能看出"哪类课表模板容易识别错"，也便于把出错样本沉淀成回归测试集。
 LOG_FILE = "recognition_log.json"
-LOG_MAX = 500          # 只保留最近 N 条，防止文件无限增长吃满云端磁盘
+LOG_MAX = 500
 
 ROUTE_TYPES = ("双通道", "规则", "视觉", "文本兜底")
 
@@ -150,9 +146,9 @@ def build_log_record(name, dbg, personal_need=""):
         "rule_covered": covered,
         "rule_text_cells": total,
         "cover_rate": round(covered / total, 3) if total else None,
-        "ai_agree": dbg.get("ai_agree"),      # True=AI与规则完全一致 False=有差异 None=未比对
-        "ai_used": dbg.get("ai_used", True),  # False=批量时关闭了AI（纯规则）
-        "week_slots": len(dbg.get("course_weeks") or {}),  # 成功解析出教学周数的时段数
+        "ai_agree": dbg.get("ai_agree"),
+        "ai_used": dbg.get("ai_used", True),
+        "week_slots": len(dbg.get("course_weeks") or {}),
         "failed": bool(dbg.get("failed")),
         "elapsed_ms": dbg.get("elapsed_ms"),
         "has_personal_need": bool(safe_str(personal_need)),
@@ -202,7 +198,6 @@ def load_admin():
     data = _safe_load_json(ADMIN_FILE, None)
     if not isinstance(data, dict) or "admins" not in data or not isinstance(data["admins"], list):
         data = {"admins": [{"username": DEFAULT_ADMIN_USER, "password": DEFAULT_ADMIN_PWD, "is_super": True}]}
-    # 防止"没有任何超级管理员"导致管理员管理页永远进不去、也无法重置（把自己锁在门外）
     if not any(a.get("is_super") for a in data["admins"] if isinstance(a, dict)):
         if not any(a.get("username") == DEFAULT_ADMIN_USER for a in data["admins"] if isinstance(a, dict)):
             data["admins"].append({"username": DEFAULT_ADMIN_USER, "password": DEFAULT_ADMIN_PWD, "is_super": True})
@@ -249,19 +244,17 @@ def load_members():
 def save_members(data):
     _atomic_write_json(DATA_FILE, data)
 
-# ========== PDF读取【三级降级：①表格线识别 ②表头锚点网格 ③纯文本】 ==========
 def _cell_text(v):
     t = re.sub(r"[|\n\r]", " ", safe_str(v))
-    # 先去掉所有空白（源PDF里字段名常被换行拆开，如"教学班组 成"）
     t = re.sub(r"\s+", "", t)
-    # 按"(X-Y节)"课程条目切分：一格里可能有多门课，逐条保留课名+节次+周次+场地+教师
+    # 一个单元格可能塞了多门课，按每条「(X-Y节)」切成独立条目
     ms = list(re.finditer(r"[^/]{1,40}\(\d+(?:-\d+)?节\)", t))
     if not ms:
         return t[:1000]
     entries = []
     for i, m in enumerate(ms):
         seg = t[m.start(): ms[i+1].start() if i + 1 < len(ms) else len(t)]
-        seg = re.split(r"/教学班", seg)[0]  # 每条记录在教学班号等元数据处截断
+        seg = re.split(r"/教学班", seg)[0]
         if seg:
             entries.append(seg)
     return "；".join(entries)[:1200]
@@ -289,7 +282,6 @@ def _grid_extract_text(pdf_bytes, row_count=13, col_count=7):
             words = page.extract_words()
             if not words or len(words) < 5:
                 continue
-            # 1) 找表头，确定7列的中心锚点
             col_centers = {}
             for w in words:
                 t = re.sub(r"星期", "周", w["text"].strip())
@@ -306,11 +298,10 @@ def _grid_extract_text(pdf_bytes, row_count=13, col_count=7):
                 header_bottom = max(w["bottom"] for w in words
                                     if re.sub(r"星期", "周", w["text"].strip()) in col_names)
                 content_words = [w for w in words if w["top"] > header_bottom]
-                # 左侧节次标签栏（在最左列边界之外的）直接丢弃
                 content_words = [w for w in content_words
                                  if any(b[0] <= (w["x0"] + w["x1"]) / 2 <= b[1] for b in bounds)]
             else:
-                # 找不到表头，退回旧的均匀网格（x0改用中心点）
+                # 表头星期不全：退回按内容宽度等分切列
                 content_words = words
                 ys = np.array([w["top"] for w in words])
                 y_low, y_high = np.percentile(ys, 10), np.percentile(ys, 90)
@@ -333,7 +324,6 @@ def _grid_extract_text(pdf_bytes, row_count=13, col_count=7):
                 row_idx = int(wy / cell_h)
                 if 0 <= col_idx < col_count and 0 <= row_idx < row_count:
                     grid[row_idx][col_idx] += w["text"] + " "
-    # 整表为空（如图片型PDF无文字层）→ 返回空串，让上层降级
     if not any(cell.strip() for row in grid for cell in row):
         return ""
     md = ["| 节次 | " + " | ".join(WEEK_NAMES) + " |",
@@ -347,7 +337,6 @@ def _grid_extract_text(pdf_bytes, row_count=13, col_count=7):
 
 def get_pdf_table_text(pdf_bytes):
     """四级提取，返回 (文本, 方式)。方式: list=清单式 table=表格线识别 grid=坐标网格 raw=纯文本 none=失败"""
-    # ⓪ 清单式课表解析（武大部分导出版式：逐块列出 星期X/节次段/课程名/周数详情，无网格）
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         raw = "".join(page.get_text() for page in doc)
@@ -361,7 +350,6 @@ def get_pdf_table_text(pdf_bytes):
                 return list_md, "list"
         except Exception:
             pass
-    # ① pdfplumber 表格线识别（有框线课表最准）
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             all_rows = []
@@ -370,17 +358,14 @@ def get_pdf_table_text(pdf_bytes):
                     for row in (table or []):
                         all_rows.append(row)
             if all_rows:
-                # 过滤图例/杂项行（如": 理论 : 上机 : 实验..."）
                 all_rows = [r for r in all_rows
                             if not re.match(r"^[:：]", "".join(_cell_text(c) for c in r).strip())]
-                # 自动定位表头行（含≥3个星期标签的行），丢弃其上方的标题/杂项行
                 hdr_idx = -1
                 for i, r in enumerate(all_rows):
                     if sum(1 for c in r if _norm_header(c) in WEEK_NAMES) >= 3:
                         hdr_idx = i
                         break
                 has_day_header = hdr_idx >= 0 or bool(re.search(r"星期|周[一二三四五六日]", "".join(_cell_text(c) for c in all_rows[0]))) if all_rows else False
-                # 表头不在表格里时不用表格线结果（列无法映射星期），降级走锚点网格
                 if has_day_header:
                     if hdr_idx >= 0:
                         header = [_norm_header(c) for c in all_rows[hdr_idx]]
@@ -389,11 +374,9 @@ def get_pdf_table_text(pdf_bytes):
                         header = [_norm_header(c) for c in all_rows[0]]
                         body = all_rows[1:]
                     if body:
-                        # 确保有节次列，便于AI对齐行号
                         if not any("节次" in h for h in header):
                             header = ["节次"] + list(header)
                             body = [[str(i + 1)] + list(r) for i, r in enumerate(body)]
-                        # 合并跨页/合并单元格产生的无节次延续行，避免AI误判行位置
                         sec_col = next((i for i, h in enumerate(header) if "节次" in h), -1)
                         if sec_col >= 0:
                             merged = []
@@ -412,14 +395,12 @@ def get_pdf_table_text(pdf_bytes):
                             return text, "table"
     except Exception:
         pass
-    # ② 表头锚点坐标网格
     try:
         text = _grid_extract_text(pdf_bytes)
         if text and len(text.strip()) > 30:
             return text, "grid"
     except Exception:
         pass
-    # ③ 纯文本兜底
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         txt = "".join(page.get_text() for page in doc)
@@ -440,7 +421,7 @@ def _parse_list_style_text(raw_text):
     sec_line_re = re.compile(r"^(\d{1,2})\s*[-–—]\s*(\d{1,2})$")
     rows = []
     week = None
-    state = "idle"  # idle=等星期/节次段  course=收课程名  detail=收周数详情
+    state = "idle"
     cur_secs, cur_course, cur_detail, cur_has_detail = "", [], [], False
 
     def flush():
@@ -458,7 +439,7 @@ def _parse_list_style_text(raw_text):
             continue
         sm = sec_line_re.match(l)
         if sm and week:
-            flush()  # 上一块异常未闭合也先落盘
+            flush()
             cur_secs = f"{int(sm.group(1))}-{int(sm.group(2))}"
             state = "course"
             continue
@@ -476,7 +457,7 @@ def _parse_list_style_text(raw_text):
                 cur_has_detail = True
                 state = "detail"
             else:
-                cur_detail.append(l)  # 周数行被换行拆开的尾巴
+                cur_detail.append(l)
     flush()
     if len(rows) < 2:
         return ""
@@ -505,10 +486,9 @@ def parse_table_courses(table_text, method):
     header = cells_of(lines[0])
     sec_pat = re.compile(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*节")
     single_pat = re.compile(r"(?<![0-9])(\d{1,2})\s*节(?![0-9])")
-    data = {}  # week -> set(sections)
+    data = {}
 
     if method == "list":
-        # | 星期 | 节次 | 课程 | 详情 |，节次列为"3-4"/"11-13"
         wi = next((i for i, h in enumerate(header) if h == "星期"), -1)
         si = next((i for i, h in enumerate(header) if h == "节次"), -1)
         if wi < 0 or si < 0:
@@ -527,9 +507,8 @@ def parse_table_courses(table_text, method):
                     data.setdefault(wk, set()).update(range(a, b + 1))
                     covered += 1
                     continue
-            partial.add(wk)  # 节次列解析失败 → 交给AI补
+            partial.add(wk)
     else:
-        # 框线表格：表头为星期名，单元格内"(X-Y节)"标注节次
         week_cols = {}
         for i, h in enumerate(header):
             w = _week_norm(h)
@@ -538,7 +517,7 @@ def parse_table_courses(table_text, method):
         if not week_cols:
             return result, covered, text_cells, partial
         sec_col = next((i for i, h in enumerate(header) if "节次" in h), -1)
-        week_stat = {w: [0, 0] for w in week_cols.values()}  # [text_cells, covered]
+        week_stat = {w: [0, 0] for w in week_cols.values()}
         for line in lines[2:]:
             cells = cells_of(line)
             cells += [""] * (len(header) - len(cells))
@@ -608,7 +587,6 @@ def _filter_ai_by_table(ai_data, table_text):
         elif h == "星期":
             list_week_col = i
     if list_week_col >= 0:
-        # 清单式：星期列里出现过的星期才算真实存在
         present = set()
         for line in lines[2:]:
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -641,6 +619,7 @@ def _gate_ai_by_rule(ai_data, rule_data, partial_weeks):
     for e in ai_data:
         w = e.get("week", "")
         secs = set(e.get("sections", []))
+        # 规则已完整解析的星期只保留交集；存疑的星期放行给 AI 补
         keep = secs if w in partial_weeks else (secs & base.get(w, set()))
         if keep:
             out.append({"week": w, "sections": sorted(keep), "courses": list(e.get("courses", []))})
@@ -678,7 +657,6 @@ def parse_filename_phone_and_role(filename):
             phone = phone_candidate
     return role, phone
 
-# ====================== AI提示词【抗幻觉】 ======================
 EXTRACT_SYS_PROMPT = """
 你是严谨课表提取工具，负责从大学课表中提取有课时段。
 ⚠️最高优先级铁律：**没有在提供的课表材料中明确出现的星期、节次，绝对禁止写入结果，禁止脑补、禁止推测、禁止联想！原文没有就不要输出，宁可返回空数组。**
@@ -757,7 +735,6 @@ def _clean_course_data(raw):
             cleaned.append({"week": w, "sections": clean_sec, "courses": courses})
     return cleaned
 
-# ========= 文本路线：qwen-plus 解析规整表格文本（带重试） =========
 def _call_course_ai(prompt_text:str):
     last_err = None
     for _ in range(MAX_RETRY + 1):
@@ -780,7 +757,6 @@ def _call_course_ai(prompt_text:str):
             last_err = e
     raise last_err
 
-# ========= 视觉路线：qwen-vl-max 直接看课表图片（带重试） =========
 def _call_course_ai_vl(images_b64):
     if not images_b64:
         raise ValueError("课表PDF渲染图片失败")
@@ -804,7 +780,6 @@ def _call_course_ai_vl(images_b64):
             last_err = e
     raise last_err
 
-# ========= 火山方舟doubao，关闭深度思考，防止脑补 =========
 def _call_personal_ai(prompt_text:str):
     sess = _make_http_session()
     headers = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
@@ -830,7 +805,6 @@ def _call_personal_ai(prompt_text:str):
     arr = json.loads(match.group(0))
     return arr if isinstance(arr, list) else []
 
-# ========= 个性化需求【幻觉压制层】：原话证据回溯 + 语义方向判定 + 确定性规则底稿 =========
 _BUSY_MARKERS = ("有课", "上课", "不能", "不行", "不可以", "没空", "没有空", "没时间",
                  "不值班", "不能值班", "不方便", "走不开", "冲突", "忙", "有事")
 _AVAIL_MARKERS = ("没课", "没有课", "不上课", "有空", "有时间", "可以", "能值班", "能来", "方便", "没事")
@@ -890,7 +864,6 @@ def parse_personal_rulebased(text):
     t = safe_str(text)
     if not t:
         return slots
-    # 先按标点+转折词切分，避免"周一上午没课但周二下午不能来"被当成一个整体
     parts = re.split(r"[，,。.、；;！!？?\n]+|但是|但|不过|可是|然而", t)
     for c0 in parts:
         c = _norm_for_match(c0)
@@ -901,12 +874,11 @@ def parse_personal_rulebased(text):
             continue
         shifts = _shifts_in_clause(c) or ["上午", "下午", "晚上"]
         allowed = _only_available_set(c)
-        if allowed is not None:  # "只在X有空" → 补集
+        if allowed is not None:
             slots |= {s for s in ALL_SLOTS if s not in allowed}
             continue
         if any(m in c for m in _BUSY_MARKERS):
             slots |= {f"{d}{s}" for d in days for s in shifts}
-        # 只出现"有空/没课"等可用词、没有忙词 → 不加入
     return slots
 
 def _validate_personal_slots(raw, text):
@@ -924,23 +896,23 @@ def _validate_personal_slots(raw, text):
         slot = re.sub(r"星[期其]", "周", slot)
         slot = slot.replace("周天", "周日")
         if slot not in ALL_SLOTS:
-            continue                      # ① 非法时段写法直接丢
+            continue
         if not ev or ev not in tnorm:
-            continue                      # ② 证据无法在原话中逐字回溯 → 判定为幻觉，丢
+            continue
         allowed = _only_available_set(ev)
-        if allowed is not None:           # ③ "只在X有空"的补集语义
+        if allowed is not None:
             if slot not in allowed:
                 valid.add(slot)
             continue
         if slot[:2] not in _days_in_clause(ev):
-            continue                      # ④ 证据里没提这个星期 → 丢
+            continue
         ev_shifts = _shifts_in_clause(ev)
         if ev_shifts and slot[2:] not in ev_shifts:
-            continue                      # ⑤ 证据写了具体时段但对不上 → 丢（没写时段视为早中晚全含）
+            continue
         if any(m in ev for m in _BUSY_MARKERS):
-            valid.add(slot)               # ⑥ 语义方向为"忙/不能" → 采纳
+            valid.add(slot)
         elif any(m in ev for m in _AVAIL_MARKERS):
-            continue                      # ⑦ 语义方向是"有空/没课" → 拒绝（AI搞反了）
+            continue
     return valid
 
 def extract_personal_slots(personal_need, course_conflict):
@@ -967,7 +939,6 @@ def extract_personal_slots(personal_need, course_conflict):
     }
     return final, info
 
-# 节次时间(分钟，从0点起算)
 SECTION_TIME = {
     1: (8*60+0, 8*60+45),
     2: (8*60+50, 9*60+35),
@@ -984,7 +955,6 @@ SECTION_TIME = {
     13:(20*60+10,20*60+55)
 }
 
-# 班次时间区间(分钟)，与 SHIFT_LIST 的三个时段一一对应
 SHIFT_TIME = {0: (9 * 60, 13 * 60), 1: (13 * 60, 17 * 60), 2: (17 * 60, 20 * 60)}
 
 _SHIFT_ORDER = {"上午": 0, "下午": 1, "晚上": 2}
@@ -995,9 +965,7 @@ def slot_sort_key(s):
     w = WEEK_NAMES.index(s[:2]) if s[:2] in WEEK_NAMES else 9
     return (w, _SHIFT_ORDER.get(s[2:], 9))
 
-# ========== 课表周数（教学周）确定性解析 ==========
-# 支持两种真实版式：清单式「周数: 3-4周,6-17周」、框线式「课程名(1-2节)3-4周,6-17周/场地...」
-# 以及 第13周 / 3-5周(单) / 4-6周(双) 等写法。解析不到周数一律按「全学期有课」保守处理。
+# 支持 3-4周,6-17周 / 第13周 / 3-5周(单) / 4-6周(双) 等真实写法
 WEEK_TOKEN_RE = re.compile(
     r"第?(\d{1,2})\s*(?:[-–—]\s*第?(\d{1,2}))?\s*周(?:\s*[(（](单|双)[)）])?")
 WEEK_NO_MIN, WEEK_NO_MAX = 1, 30
@@ -1120,6 +1088,7 @@ def parse_course_weeks(table_text, method):
                         add(wk, {row_sec}, weeks)
     result = {}
     for slot, lst in slot_entries.items():
+        # 该时段有任一课程条目没解析出周数就整段不写入，调用方按全学期保守处理
         if lst and all(ws for ws in lst):
             result[slot] = sorted(set().union(*lst))
     return result
@@ -1150,14 +1119,9 @@ def _can_render_debug():
         return False
 
 def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None, allow_ai:bool=True):
-    """智能体主链路：AI 全程参与识别；规则解析作为确定性底稿与防幻觉闸门。
-    路线：① 表格/清单式 → 规则解析 + qwen 文本模型（AI补漏、规则兜底）
-          ② 网格/图片型 → qwen-vl-max 视觉直接读图
-          ③ 全部失败 → 文本模型兜底
-    debug_sink: 传入 dict 时把识别详情写进去（供工作线程调用方在主线程渲染）。
-    allow_ai: 批量提速开关。False 时，若该文件规则解析已 100% 覆盖（结果与AI完全等价），
-              跳过课表文本模型调用；规则未全覆盖时仍会自动启用 AI（否则不准）。
-              ⚠️ 个性化需求（doubao）不受此开关影响，有需求一定调用。
+    """课表识别主链路：规则解析做确定性底稿，AI 负责补漏，两者取并集；周数只从规整表格确定性解析。
+    路线①表格/清单式走规则+qwen 文本；②网格/图片型走 qwen-vl 读图；③全部失败时文本兜底。
+    allow_ai=False 为批量提速：规则已 100% 覆盖时跳过课表 AI 调用，覆盖不全仍会自动启用。
     """
     t0 = time.time()
     table_text, method = get_pdf_table_text(pdf_bytes)
@@ -1165,13 +1129,12 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
     route = ""
     ai_used = True
     dbg = debug_sink if isinstance(debug_sink, dict) else {}
-    dbg["course_weeks"] = {}   # 默认保守：无周次信息 = 全学期有课
+    dbg["course_weeks"] = {}
     rule_data, rule_covered, rule_text_cells, rule_partial = [], 0, 0, set()
     ai_agree = None
     ai_skipped = False
     rule_complete = False
     raw_ai_count = 0
-    # 课表周数：只从规整表格做确定性解析（图片型/视觉路线没有可靠文本 → 留空走保守）
     course_weeks = {}
     if method in ("table", "list"):
         try:
@@ -1182,14 +1145,13 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
 下面是课表原文（Markdown表格）。表头行标注了星期几（顺序可能从周日开始，以表头实际标注为准）；有一列是节次编号；节次可能写在单元格内"(X-Y节)"，也可能写成"3-4"这种区间，两种都表示该课占据第X节到第Y节。请提取所有有课的星期和节次，以单元格的星期列位置和节次信息为准：
 {table_text[:12000]}
 """
-    # ---- 路线①：表格/清单式 → 规则解析 + AI 文本模型 双通道（AI始终参与） ----
     if method in ("table", "list") and len(table_text.strip()) >= 10:
         try:
             rule_data, rule_covered, rule_text_cells, rule_partial = parse_table_courses(table_text, method)
         except Exception:
             rule_data, rule_covered, rule_text_cells, rule_partial = [], 0, 0, set()
         ai_part, ai_err, ai_skipped = [], "", False
-        # 提速：批量且规则已100%覆盖 → 跳过课表AI调用（此时AI加不了任何信息，结果等价）
+        # 规则已覆盖全部有课格子时，AI 加不了新信息 → 可安全跳过
         rule_complete = bool(rule_data) and rule_text_cells >= 2 and rule_covered >= rule_text_cells
         if (not allow_ai) and rule_complete:
             ai_skipped = True
@@ -1199,15 +1161,14 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                 ai_part = _clean_course_data(_call_course_ai(prompt_course))
             except Exception as e:
                 ai_err = str(e)[:60]
-        raw_ai_count = len(ai_part)  # 供DEBUG参考：AI原始条数（过滤前）
-        ai_part = _filter_ai_by_table(ai_part, table_text)          # 抗幻觉①：AI说的星期必须在表格真实存在
-        ai_part = _gate_ai_by_rule(ai_part, rule_data, rule_partial)  # 抗幻觉②：规则已完整覆盖的星期不许AI新增
+        raw_ai_count = len(ai_part)
+        ai_part = _filter_ai_by_table(ai_part, table_text)
+        ai_part = _gate_ai_by_rule(ai_part, rule_data, rule_partial)
         ai_course_data = _merge_course_data(rule_data, ai_part)
         if ai_course_data:
             if ai_skipped:
                 route = f"规则路线：{method}表格直接解析（批量AI已关闭，规则100%覆盖，零调用）"
             elif rule_data:
-                # AI 与规则是否完全一致（用于DEBUG核对）
                 rule_map = {e["week"]: set(e["sections"]) for e in rule_data}
                 ai_map = {e["week"]: set(e["sections"]) for e in ai_part}
                 ai_agree = (rule_map == ai_map)
@@ -1219,14 +1180,12 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                 route += "｜该文件规则未完全覆盖，已自动启用AI保准确"
         elif ai_err:
             route = f"规则路线：{method}表格直接解析（AI异常已忽略：{ai_err}）"
-    # ---- 路线②：网格近似/图片型PDF/上一路线失败 → 视觉大模型直接读图 ----
     if not ai_course_data:
         try:
             imgs = pdf_to_images_b64(pdf_bytes)
             ai_course_data = _clean_course_data(_call_course_ai_vl(imgs))
             route = f"视觉路线：{COURSE_VL_MODEL} 直接读图"
         except Exception as e_vl:
-            # ---- 路线③：视觉路线也失败 → 文本路线最后兜底 ----
             if method in ("grid", "raw", "list") and len(table_text.strip()) >= 10:
                 try:
                     ai_course_data = _clean_course_data(_call_course_ai(prompt_course))
@@ -1244,11 +1203,9 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
         dbg.update({"route": route, "method": method, "failed": True, "ai_used": ai_used,
                     "elapsed_ms": int((time.time() - t0) * 1000)})
         return f"课表识别失败:{str(e)[:60]}"
-    # 周数可信度闸门：只有规整表格 + 规则解析 100% 覆盖 + 没走视觉读图时，才敢按周数放行。
-    # 否则 AI 可能在同一个时段补出规则没读到的课，放行就会误排 —— 这种情况整份课表按全学期保守处理。
+    # 规则未 100% 覆盖时整份课表按全学期保守，避免 AI 补漏的课被误放行
     if rule_complete and "视觉路线" not in route:
         dbg["course_weeks"] = {k: v for k, v in course_weeks.items() if k in course_conflict}
-    # ---- 识别详情：收集到 debug_sink（批量线程）或在线程内直接渲染 ----
     dbg.update({
         "route": route,
         "method": method,
@@ -1278,7 +1235,6 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                         st.text(dbg["table_text"])
         except Exception:
             pass
-    # ---- 个性化需求：doubao 识别 + 原话证据回溯校验（强幻觉压制） ----
     personal_slots, personal_info = [], {}
     if personal_need and personal_need.strip() not in ("", "无"):
         personal_slots, personal_info = extract_personal_slots(personal_need, course_conflict)
@@ -1295,7 +1251,6 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
                     st.caption("说明：AI输出的每条时段都必须能在你的原话里找到逐字依据，找不到依据的会被自动丢弃。")
             except Exception:
                 pass
-    # 个性化需求是「每周都不值班」，不受教学周影响，从周数豁免里剔除
     if personal_slots and dbg.get("course_weeks"):
         dbg["course_weeks"] = {k: v for k, v in dbg["course_weeks"].items()
                                if k not in set(personal_slots)}
@@ -1305,7 +1260,6 @@ def fast_ai_extract(pdf_bytes:bytes, personal_need:str="", debug_sink:dict=None,
         return "识别为空，请手动填写"
     return "、".join(total)
 
-# ========== 判断某人在某时段是否有空 ==========
 def _normalize_week_range(value):
     """把排班周次参数统一成 (起, 止)；None 表示不按周判断（旧行为）。单周 int 视为 (n, n)。"""
     if value is None:
@@ -1339,13 +1293,12 @@ def is_available(member, week_idx, shift_idx, week_range=None):
                     try:
                         busy = {int(x) for x in weeks}
                         if not any(w in busy for w in range(rng[0], rng[1] + 1)):
-                            return True   # 所选周次内这门课都不上 → 可以排班
+                            return True
                     except (TypeError, ValueError):
                         pass
         return False
     return True
 
-# ========== 智能排班（稀缺度优先 + 均衡 + 绝不违背课表） ==========
 def _available_slot_keys(member, week_range=None):
     """该成员本次排班可以值班的 (week_idx, shift_idx) 集合。"""
     return {(w, s) for w in range(len(WEEK_NAMES)) for s in range(len(SHIFT_LIST))
@@ -1355,16 +1308,9 @@ def _slot_key(slot):
     return (slot["week_idx"], slot["shift_idx"])
 
 def smart_schedule(member_list, week_range=None):
-    """排班策略：
-    ⓪ 按所选教学周区间分析：区间内任意一周有课的时段禁排；整个区间都不上的课放行；
-       未标注周数/老数据按全学期有课保守处理；
-    ① 稀缺度优先：可用人数越少的班次越先排，避免"好排的时段先把稀缺人员抢光、难排的时段最后没人"；
-    ② 越受限的人越先排：候选按自身可用时段数升序（可选时段少的人优先锁定，把自由的人留到后面）；
-    ③ 学员分多轮放开上限（1→2→3 班）：先保证人人有一次班，人不够时再用"确实有空"的人补位；
-    ④ 职委按当前班次数升序轮转，天然均衡；
-    ⑤ 学员绝不违背课表：排不满的班次留空并标记「待人工指派」；
-       职委优先排无课时段，该时段确实没有空闲职委时，从其余职委里随机抽人兜底
-       （允许有课值班，会在「备注」和告警里逐个标明，方便人工复核调整）。
+    """按所选教学周区间分析 → 稀缺度优先 → 受限人员优先 → 学员 1/2/3 班多轮放开 → 职委轮转。
+    区间内有课禁排、整段无课放行；学员岗绝不安排有课人员（留空标记「待人工指派」）；
+    职委优先无课时段，无空闲职委时随机抽有课职委兜底并在备注与告警中标明。
     """
     rng = _normalize_week_range(week_range)
     stu_pool = [m for m in member_list if safe_str(m.get("role")) == "学员"]
@@ -1386,16 +1332,16 @@ def smart_schedule(member_list, week_range=None):
         for s_idx, s in enumerate(SHIFT_LIST):
             all_slots.append({"week_idx": w_idx, "shift_idx": s_idx, "week": w, "shift": s["shift_name"]})
 
-    tie = {id(m): random.random() for m in stu_pool + wei_pool}   # 同分时随机打破平局（每次排班不完全相同）
+    tie = {id(m): random.random() for m in stu_pool + wei_pool}
 
-    # ---------- 学员 ----------
     stu_avail = {id(m): _available_slot_keys(m, rng) for m in stu_pool}
     stu_cnt = {id(m): 0 for m in stu_pool}
-    # 每个班次有多少学员可选 → 稀缺度（人数越少越难排，必须最先满足）
+    # 每个班次有多少学员可选：越少越难排，优先满足
     cand_cnt = {_slot_key(s): sum(1 for m in stu_pool if _slot_key(s) in stu_avail[id(m)]) for s in all_slots}
     order = sorted(all_slots, key=lambda s: (cand_cnt[_slot_key(s)], s["week_idx"], s["shift_idx"]))
     assign = {_slot_key(s): [] for s in all_slots}
-    for cap in (1, 2, 3):        # 第一轮每人最多1班；仍有空缺再用有空的人补第2、3班（不违背课表）
+    # 第一轮每人 1 班保底，人不够再逐轮放宽到 2、3 班
+    for cap in (1, 2, 3):
         for slot in order:
             k = _slot_key(slot)
             need = SHIFT_LIST[slot["shift_idx"]]["need_stu"]
@@ -1411,23 +1357,20 @@ def smart_schedule(member_list, week_range=None):
                 assign[k].append(m)
                 stu_cnt[id(m)] += 1
 
-    # ---------- 职委 ----------
     wei_avail = {id(m): _available_slot_keys(m, rng) for m in wei_pool}
     wei_cnt = {id(m): 0 for m in wei_pool}
     wei_cand_cnt = {_slot_key(s): sum(1 for m in wei_pool if _slot_key(s) in wei_avail[id(m)]) for s in all_slots}
     wei_order = sorted(all_slots, key=lambda s: (wei_cand_cnt[_slot_key(s)], s["week_idx"], s["shift_idx"]))
     wei_assign = {_slot_key(s): [] for s in all_slots}
-    wei_forced = {_slot_key(s): [] for s in all_slots}   # 该时段没有空闲职委、被随机安排的有课职委
+    wei_forced = {_slot_key(s): [] for s in all_slots}
     for slot in wei_order:
         k = _slot_key(slot)
         need = SHIFT_LIST[slot["shift_idx"]]["need_wei"]
         cands = [m for m in wei_pool if k in wei_avail[id(m)]]
-        cands.sort(key=lambda m: (wei_cnt[id(m)], len(wei_avail[id(m)]), tie[id(m)]))   # 班次少的先上 → 均衡
+        cands.sort(key=lambda m: (wei_cnt[id(m)], len(wei_avail[id(m)]), tie[id(m)]))
         for m in cands[:need]:
             wei_assign[k].append(m)
             wei_cnt[id(m)] += 1
-        # 兜底：实在没有空闲职委 → 从其余职委里随机抽（tie 是本轮随机序），允许有课值班。
-        # 先按班次数升序再随机：班次最少的职委中随机挑一位，避免某个人被连续兜底。
         if len(wei_assign[k]) < need and wei_pool:
             rest = [m for m in wei_pool if not any(id(x) == id(m) for x in wei_assign[k])]
             rest.sort(key=lambda m: (wei_cnt[id(m)], tie[id(m)]))
@@ -1438,7 +1381,6 @@ def smart_schedule(member_list, week_range=None):
                 wei_forced[k].append(m)
                 wei_cnt[id(m)] += 1
 
-    # ---------- 组装 + 缺口诊断 ----------
     schedule, pending = [], []
     for slot in all_slots:
         k = _slot_key(slot)
@@ -1455,7 +1397,6 @@ def smart_schedule(member_list, week_range=None):
             else:
                 reasons.append(f"有空学员的排班已达上限（缺{gap_stu}人）")
         if gap_wei:
-            # 职委已有随机兜底，仍缺人只可能是人员库里没有职委（或职委数少于需求）
             reasons.append("人员库中没有职委" if not wei_pool else f"职委人数不足（缺{gap_wei}人）")
         note = ("待人工指派：" + "；".join(reasons)) if reasons else ""
         if wei_forced[k]:
@@ -1472,7 +1413,6 @@ def smart_schedule(member_list, week_range=None):
             "缺口": gap_stu + gap_wei, "备注": note,
         })
 
-    # ---------- 诊断输出 ----------
     rested = [safe_str(m.get("name")) for m in stu_pool if stu_cnt[id(m)] == 0]
     if rested:
         st.info(f"ℹ️ 本周共 {len(rested)} 名学员轮空：{'、'.join(rested)}")
@@ -1480,7 +1420,6 @@ def smart_schedule(member_list, week_range=None):
         st.error(f"⚠️ {len(pending)} 个班次的学员岗无法在「不违背课表」的前提下排满，已留空标记「待人工指派」"
                  f"（学员不会自动安排有课人员）。请手动指派后再导出。")
         st.dataframe(pd.DataFrame(pending), use_container_width=True)
-    # 职委兜底告警：列出哪些班次安排了有课职委，方便人工复核
     forced_slots = [s for s in all_slots if wei_forced[_slot_key(s)]]
     if forced_slots:
         st.warning(f"⚠️ {len(forced_slots)} 个班次没有空闲职委，已随机安排有课职委兜底值班（职委优先无课时段，"
@@ -1502,7 +1441,6 @@ def smart_schedule(member_list, week_range=None):
             f"{s['week']}{SHIFT_PERIOD[s['shift_idx']]}({cand_cnt[_slot_key(s)]}人可选)" for s in tight))
     return schedule
 
-# ========== 模式A：系统自动生成PDF ==========
 def export_pdf_auto(schedule_data, template_name):
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -1538,11 +1476,9 @@ def export_pdf_auto(schedule_data, template_name):
     buf.seek(0)
     return buf
 
-# ========== 模式B：填充用户模板 ==========
-# 新版式参数（由官方填写样例反推）：填充文字统一字号、姓名/手机行距固定
 _DUTY_SIZE = 11.1
 _DUTY_MIN_SIZE = 7.5
-_DUTY_LINE = 15.1          # 姓名/手机两行行距（pt）
+_DUTY_LINE = 15.1
 _DAY_ORDER = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 try:
     _FONT_CJK = fitz.Font("china-s")
@@ -1680,7 +1616,7 @@ def _fill_anchored(page, layout, schedule_data, offset_x, offset_y, start_date, 
             for p in entry["职委"]:
                 cell_dict[k]["wei"].append((safe_str(p.get("name")), safe_str(p.get("phone"))))
     for si, (stu_cy, wei_cy) in enumerate(layout["zones"]):
-        half = (wei_cy - stu_cy) * 2 / 3   # 学员子行内上下两半的中心距（由样例反推）
+        half = (wei_cy - stu_cy) * 2 / 3
         for wi in range(7):
             cx = cols_x[wi] + offset_x
             data = cell_dict[(si, wi)]
@@ -1695,12 +1631,30 @@ def _fill_anchored(page, layout, schedule_data, offset_x, offset_y, start_date, 
         try:
             rect = fitz.Rect(title["bbox"])
             sz = title["size"]
-            page.add_redact_annot(rect)
-            page.apply_redactions()
             text = (f"{int(start_date.year)}.{int(start_date.month):02d}.{int(start_date.day):02d}"
                     f"-{int(end_date.year)}.{int(end_date.month):02d}.{int(end_date.day):02d}")
-            page.insert_text((rect.x0, rect.y1 - sz * 0.25), text, fontsize=sz,
+            close_rect, close_text = None, ""
+            for s in _page_spans(page):
+                b = fitz.Rect(s["bbox"])
+                if (b.y0 < rect.y1 and b.y1 > rect.y0
+                        and rect.x1 - 2 <= b.x0 < rect.x1 + 12
+                        and s["text"] in ("）", ")")):
+                    close_rect, close_text = b, s["text"]
+                    break
+            page.add_redact_annot(rect)
+            if close_rect:
+                page.add_redact_annot(close_rect)
+            page.apply_redactions()
+            baseline = rect.y1 - sz * 0.25
+            page.insert_text((rect.x0, baseline), text, fontsize=sz,
                              fontname="tibo", color=(0, 0, 0))
+            if close_rect:
+                try:
+                    dw = fitz.get_text_length(text, fontname="tibo", fontsize=sz)
+                except Exception:
+                    dw = 0.55 * sz * len(text)
+                page.insert_text((rect.x0 + dw, baseline), close_text,
+                                 fontsize=sz, fontname="china-s", color=(0, 0, 0))
         except Exception:
             pass
 
@@ -1710,10 +1664,8 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     page = doc[0]
     layout = _detect_duty_template(page)
     if layout is not None:
-        # 新版式：文字锚点自动定位，无需手动微调单元格尺寸
         _fill_anchored(page, layout, schedule_data, offset_x, offset_y, start_date, end_date)
     else:
-        # 旧版固定网格（老模板兜底，行为与历史版本一致）
         start_x = 158 + offset_x
         start_y = 175 + offset_y
         font_title = 6
@@ -1769,7 +1721,6 @@ def fill_user_template_pdf(template_bytes, schedule_data, offset_x:int=0, offset
     out_buf.seek(0)
     return out_buf
 
-# ========== 页面壁纸（自定义操作页背景图） ==========
 WALLPAPER_CFG_FILE = "wallpaper_config.json"
 WALLPAPER_IMG_BASE = "wallpaper"
 
@@ -1820,30 +1771,26 @@ def clear_wallpaper():
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def _wallpaper_data_uri(path, mtime, blur):
-    """背景图 → data URI。模糊在服务端用 PIL 做真实高斯模糊后烤进图片里。
-
-    为什么不用 CSS：backdrop-filter 在 Streamlit 的容器结构下会被父级
-    background-attachment: fixed 打断，Chrome 直接采样不到背景，滑块等于没有效果；
-    而给背景层加 filter: blur 又依赖 ::before 的层叠顺序，容易在不同版本失效。
-    直接把像素模糊掉，浏览器只管显示一张图，任何浏览器/任何 Streamlit 版本都一致。
-    mtime 进缓存键：换了图自动失效；同一个 blur 值反复渲染命中缓存，不会重复计算。
+    """背景图转 data URI，模糊由服务端 PIL 完成（CSS backdrop-filter 在 Streamlit 下不生效）。
+    mtime 参与缓存键，换图自动失效；同一 blur 值重复渲染命中缓存。
     """
     with open(path, "rb") as f:
-        data, _ext = _compress_wallpaper(f.read())      # 已有逻辑：≤1920 宽 + JPEG q82
+        data, _ext = _compress_wallpaper(f.read())
     blur = max(0, int(blur))
     if blur:
         try:
             from PIL import Image, ImageFilter
             img = Image.open(BytesIO(data)).convert("RGB")
             w, h = img.size
-            pad = blur * 3 + 8                          # 四周复制边缘像素，避免模糊后出现黑边
+            # 四周外扩边缘像素后再模糊、再裁回原尺寸，避免模糊出现黑边
+            pad = blur * 3 + 8
             arr = np.pad(np.asarray(img), ((pad, pad), (pad, pad), (0, 0)), mode="edge")
             out = BytesIO()
             Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=blur)) \
                  .crop((pad, pad, pad + w, pad + h)).save(out, format="JPEG", quality=86)
             data = out.getvalue()
         except Exception:
-            pass                                        # 没装 Pillow 就不模糊，背景照常显示
+            pass
     mime = "image/jpeg" if data[:3] == b"\xff\xd8\xff" else "image/png"
     return f'data:{mime};base64,{base64.b64encode(data).decode()}'
 
@@ -1886,7 +1833,6 @@ def apply_wallpaper():
 </style>
 """, unsafe_allow_html=True)
 
-# ========== 页面入口 ==========
 st.set_page_config(page_title="值班排班系统", layout="wide")
 apply_wallpaper()
 if "login" not in st.session_state:
@@ -1960,8 +1906,8 @@ if menu == "管理员后台":
             st.caption("💡 若上传时出现「AxiosError: Request failed with status code 500」：这是 Streamlit 云端上传通道的偶发故障（与课表内容无关），刷新页面后重新选择文件即可；建议一次少选几个、分批上传更稳。")
             if up_files and st.button("📂 第一步：缓存PDF二进制，解析姓名身份电话"):
                 with st.spinner("读取PDF文件..."):
-                    pairs = []          # [(成员dict, pdf字节)] —— 成对保存，杜绝"人与文件串位"
-                    bad_files = []      # 解析不出姓名的文件，明确提示管理员
+                    pairs = []
+                    bad_files = []
                     for f in up_files:
                         b = f.read()
                         try:
@@ -1991,8 +1937,8 @@ if menu == "管理员后台":
                         unique.append(item)
                         unique_pdf.append(b)
                     st.session_state.temp_new_member = unique
-                    st.session_state.temp_pdf_bytes = unique_pdf                # 与 unique 严格同序、同长
-                    st.session_state.temp_pdf_by_name = {item["name"]: b for item, b in zip(unique, unique_pdf)}  # 按姓名绑定，删行/调序也不会串位
+                    st.session_state.temp_pdf_bytes = unique_pdf
+                    st.session_state.temp_pdf_by_name = {item["name"]: b for item, b in zip(unique, unique_pdf)}
                 msg = f"已缓存 {len(unique)} 份PDF，填写个性化需求后执行AI识别"
                 if bad_files:
                     msg += f"；⚠️ 有 {len(bad_files)} 个文件未能从PDF解析出姓名，已跳过，请核对后单独上传：{'、'.join(bad_files[:5])}"
@@ -2073,7 +2019,6 @@ if menu == "管理员后台":
                                 row["name"] = safe_str(row.get("name"))
                                 row["phone"] = safe_str(row.get("phone"))
                                 row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
-                            # 记录识别异常人员，rerun后在页面上方提示人工核对
                             st.session_state.ai_failed_names = [safe_str(r.get("name")) for r in current_rows if is_recognize_failed(r.get("class_conflict"))]
                             st.session_state.temp_debug = {safe_str(current_rows[i].get("name")): dbg_map.get(i, {}) for i in need_ai_idx}
                             _wk_map = st.session_state.get("temp_week_map", {})
@@ -2081,7 +2026,6 @@ if menu == "管理员后台":
                                             for i in need_ai_idx})
                             st.session_state.temp_week_map = _wk_map
                             st.session_state.temp_new_member = current_rows
-                            # ---- 写入识别质量日志（主线程统一写，避免多线程争抢文件） ----
                             try:
                                 append_recognition_log([
                                     build_log_record(current_rows[i].get("name"), dbg_map.get(i, {}),
@@ -2110,7 +2054,6 @@ if menu == "管理员后台":
                             row["personal_need"] = safe_str(row.get("personal_need"))
                             row["class_conflict"] = safe_str(row.get("class_conflict"))
                             row["role"] = safe_str(row.get("role")) if safe_str(row.get("role")) else "学员"
-                            # 识别失败/为空的记录直接入库会导致排班静默出错，必须人工补填后再保存
                             if is_recognize_failed(row["class_conflict"]):
                                 skipped.append(nm)
                                 continue
@@ -2138,7 +2081,6 @@ if menu == "管理员后台":
                         st.session_state.ai_failed_names = []
                         st.session_state.temp_debug = {}
                         st.rerun()
-            # ---------- 识别质量看板（可观测：哪类模板容易出错） ----------
             st.divider()
             _log = load_recognition_log()
             with st.expander(f"📈 识别质量日志（已累计 {len(_log)} 条，保留最近 {LOG_MAX} 条）"):
@@ -2176,7 +2118,6 @@ if menu == "管理员后台":
         with tab2:
             st.subheader(f"人员库管理（共 {len(load_members())} 人）")
             mem = load_members()
-            # 周次明细是结构化字典：不放进可编辑表格（会被当成文本列覆盖丢失），按姓名单独保管
             week_map = {safe_str(m.get("name")): m["course_weeks"]
                         for m in mem if isinstance(m.get("course_weeks"), dict) and m["course_weeks"]}
             disp_mem = [{k: v for k, v in m.items() if k != "course_weeks"} for m in mem]
@@ -2411,7 +2352,6 @@ if menu == "管理员后台":
                 if st.button("🔧 一键恢复默认账号密码", disabled=not confirm_reset):
                     reset_default_admin()
                     st.success("✅ 已重置！现在账号 admin，密码 123456，请重新登录后立即修改密码。")
-                # ---------- 页面壁纸 ----------
                 st.divider()
                 st.markdown("#### 🖼️ 页面壁纸（自定义操作页背景图）")
                 _wcfg = load_wallpaper_config()
@@ -2447,9 +2387,6 @@ if menu == "管理员后台":
                 with wb2:
                     if st.button("🗑️ 移除壁纸"):
                         clear_wallpaper()
-                        # 不能直接赋值：toggle 已在本轮实例化，赋值会抛
-                        # StreamlitWidgetAlreadyInstantiatedError。删除 key 让控件
-                        # 回落到默认值，下一轮 apply_wallpaper 会读到配置里的 enabled=False。
                         st.session_state.pop("wallpaper_enabled", None)
                         st.success("已移除壁纸，恢复默认白色背景")
                         st.rerun()
@@ -2521,7 +2458,6 @@ elif menu == "成员自助上传":
                     conflict_owner = None
                     for m in all_mem:
                         if m["name"] == pending["name"]:
-                            # 同名但手机号不同：可能是重名或误填，避免覆盖别人的时段
                             if safe_str(m.get("phone")) and safe_str(m.get("phone")) != pending["phone"]:
                                 conflict_owner = m
                                 break
